@@ -124,8 +124,8 @@ check('member can list members', r.status === 200 && Array.isArray(r.data.member
 check('member has an invite quota of 5 (5 remaining)',
   r.data.invite_limit === 5 && r.data.invites_remaining === 5,
   JSON.stringify({ limit: r.data.invite_limit, rem: r.data.invites_remaining }));
-check('member sees the superadmin in the list',
-  r.data.members.some((m) => m.email.toLowerCase() === SA_EMAIL.toLowerCase()));
+check('superadmin is hidden from the members list',
+  !r.data.members.some((m) => m.email.toLowerCase() === SA_EMAIL.toLowerCase()));
 check('members list does not expose roles',
   r.data.members.every((m) => m.is_superadmin === undefined));
 check('members list does not expose status to members',
@@ -134,6 +134,8 @@ check('members list does not expose status to members',
 r = await sa.req('GET', '/api/members');
 check('superadmin invites are unlimited (limit null)', r.status === 200 && r.data.invite_limit === null,
   JSON.stringify({ limit: r.data.invite_limit }));
+check('superadmin account is hidden from its own management view too',
+  !r.data.members.some((m) => m.email.toLowerCase() === SA_EMAIL.toLowerCase()));
 
 const invited = [];
 for (let i = 0; i < 5; i++) {
@@ -356,10 +358,49 @@ r = await member.req('POST', '/api/login', { email: memberEmail, password: 'rese
 check('reactivated member can log in again', r.status === 200);
 
 // --- self-protection ---
-const me = await sa.req('GET', '/api/members');
-const saRow = me.data.members.find((m) => m.email.toLowerCase() === SA_EMAIL.toLowerCase());
-r = await sa.req('POST', `/api/members/${saRow.id}/deactivate`);
+// The superadmin no longer appears in the list, so get their id from /api/me.
+const meInfo = await sa.req('GET', '/api/me');
+r = await sa.req('POST', `/api/members/${meInfo.data.user.id}/deactivate`);
 check('superadmin cannot deactivate their own account', r.status === 400, JSON.stringify(r.data));
+
+// --- email templates (superadmin editor) ---
+r = await member.req('GET', '/api/email-templates');
+check('member cannot read email templates', r.status === 403);
+r = await sa.req('GET', '/api/email-templates');
+check('superadmin lists email templates', r.status === 200 && r.data.templates.length === 3,
+  JSON.stringify(r.data?.templates?.length));
+let invTmpl = r.data.templates.find((t) => t.key === 'invite');
+check('invite template starts as default', invTmpl && invTmpl.is_custom === false,
+  JSON.stringify(invTmpl?.is_custom));
+
+r = await sa.req('POST', '/api/email-templates/invite/preview',
+  { subject: 'Hi {{invitedBy}}', button: 'Go', body: 'Welcome aboard\n\n{{link}}' });
+check('preview renders text + html', r.status === 200 &&
+  /Welcome aboard/.test(r.data.text) && /<a /.test(r.data.html), JSON.stringify(r.data).slice(0, 100));
+
+r = await sa.req('PUT', '/api/email-templates/invite', { subject: 'x', button: 'y', body: 'no link' });
+check('template body without {{link}} rejected', r.status === 400, JSON.stringify(r.data));
+
+r = await sa.req('PUT', '/api/email-templates/invite',
+  { subject: 'Welcome to the club', button: 'Join', body: 'Hello\n\n{{link}}\n\nBye' });
+check('superadmin saves a template override', r.status === 200);
+r = await sa.req('GET', '/api/email-templates');
+invTmpl = r.data.templates.find((t) => t.key === 'invite');
+check('override shows as custom with the new subject',
+  invTmpl.is_custom === true && invTmpl.subject === 'Welcome to the club', JSON.stringify(invTmpl));
+
+r = await member.req('PUT', '/api/email-templates/invite', { subject: 'x', button: 'y', body: '{{link}}' });
+check('member cannot edit templates', r.status === 403);
+
+r = await sa.req('POST', '/api/email-templates/invite/test', { subject: 's', button: 'b', body: '{{link}}' });
+check('test send returns gracefully when mail is off', r.status === 200 && r.data.sent === false,
+  JSON.stringify(r.data));
+
+r = await sa.req('DELETE', '/api/email-templates/invite');
+check('reset template to default', r.status === 200);
+r = await sa.req('GET', '/api/email-templates');
+invTmpl = r.data.templates.find((t) => t.key === 'invite');
+check('template is default again after reset', invTmpl.is_custom === false);
 
 // --- logout ---
 r = await sa.req('POST', '/api/logout');

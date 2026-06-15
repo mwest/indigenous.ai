@@ -5,7 +5,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import db, { AVATAR_DIR } from './db.js';
-import { APP_URL, inviteEmail, resetEmail, sendMail, verifyEmailChangeEmail } from './mail.js';
+import {
+  APP_URL, inviteEmail, resetEmail, sendMail, verifyEmailChangeEmail,
+  TEMPLATE_META, defaultTemplate, sampleVars, renderTemplateObject,
+} from './mail.js';
 import {
   COOKIE_NAME,
   cookieOptions,
@@ -410,13 +413,15 @@ function inviterLabel(member, fallbackUser) {
 
 api.get('/members', (req, res) => {
   const isSuper = !!req.user.is_superadmin;
-  // The superadmin sees everyone (with status) so they can manage accounts;
-  // regular members see only active, registered members and no status.
+  // Superadmin accounts are administrative only and never appear in the Members
+  // list (for anyone). The superadmin still sees status for the members they
+  // manage; regular members see only active, registered members and no status.
   const rows = isSuper
     ? db.prepare(`${memberSelect}
+         WHERE u.is_superadmin = 0
          ORDER BY (u.deactivated_at IS NOT NULL), u.name IS NULL, u.name, u.email`).all()
     : db.prepare(`SELECT id, name, email, username, avatar_ext, profile_visible FROM users
-         WHERE password_hash IS NOT NULL AND deactivated_at IS NULL
+         WHERE is_superadmin = 0 AND password_hash IS NOT NULL AND deactivated_at IS NULL
          ORDER BY name IS NULL, name, email`).all();
   // A member's profile handle/avatar are exposed only if they've opted in.
   const members = rows.map(({ avatar_ext, profile_visible, username, ...m }) => ({
@@ -480,6 +485,73 @@ api.post('/members/:id/reactivate', requireSuperadmin, (req, res) => {
   if (!user.deactivated_at) return bad(res, 'That account is not deactivated');
   db.prepare('UPDATE users SET deactivated_at = NULL WHERE id = ?').run(user.id);
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Email templates (superadmin) — edit the copy of the emails the app sends.
+// An override row means "custom"; absence means the built-in default is used.
+// ---------------------------------------------------------------------------
+
+const effectiveTemplateRow = (key) => {
+  const o = db.prepare('SELECT subject, button, body FROM email_templates WHERE key = ?').get(key);
+  return { ...(o || defaultTemplate(key)), is_custom: !!o };
+};
+
+api.get('/email-templates', requireSuperadmin, (req, res) => {
+  const list = Object.entries(TEMPLATE_META).map(([key, meta]) => ({
+    key, label: meta.label, placeholders: meta.placeholders,
+    ...effectiveTemplateRow(key),
+    default: defaultTemplate(key),
+  }));
+  res.json({ templates: list });
+});
+
+// Validate a submitted template; replies 400/404 and returns null on failure.
+function readTemplateBody(req, res) {
+  if (!TEMPLATE_META[req.params.key]) { bad(res, 'Unknown template', 404); return null; }
+  const subject = String(req.body?.subject ?? '').trim();
+  const button = String(req.body?.button ?? '').trim();
+  const body = String(req.body?.body ?? '');
+  if (!subject || !button || !body.trim()) {
+    bad(res, 'Subject, button label, and body are all required'); return null;
+  }
+  if (!body.includes('{{link}}')) {
+    bad(res, 'The body must include {{link}} on its own line (where the button goes)'); return null;
+  }
+  return { subject, button, body };
+}
+
+api.put('/email-templates/:key', requireSuperadmin, (req, res) => {
+  const t = readTemplateBody(req, res);
+  if (!t) return;
+  db.prepare(
+    `INSERT INTO email_templates (key, subject, button, body, updated_at)
+     VALUES (?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET
+       subject = excluded.subject, button = excluded.button,
+       body = excluded.body, updated_at = datetime('now')`
+  ).run(req.params.key, t.subject, t.button, t.body);
+  res.json({ ok: true });
+});
+
+api.delete('/email-templates/:key', requireSuperadmin, (req, res) => {
+  if (!TEMPLATE_META[req.params.key]) return bad(res, 'Unknown template', 404);
+  db.prepare('DELETE FROM email_templates WHERE key = ?').run(req.params.key);
+  res.json({ ok: true, ...defaultTemplate(req.params.key) });
+});
+
+api.post('/email-templates/:key/preview', requireSuperadmin, (req, res) => {
+  const t = readTemplateBody(req, res);
+  if (!t) return;
+  res.json(renderTemplateObject(t, sampleVars(req.params.key)));
+});
+
+api.post('/email-templates/:key/test', requireSuperadmin, async (req, res) => {
+  const t = readTemplateBody(req, res);
+  if (!t) return;
+  const mail = renderTemplateObject(t, sampleVars(req.params.key));
+  const { sent, reason } = await sendMail({ to: req.user.email, ...mail });
+  res.json({ ok: true, sent, reason, to: req.user.email });
 });
 
 // ---------------------------------------------------------------------------

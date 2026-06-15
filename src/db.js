@@ -64,6 +64,17 @@ CREATE TABLE IF NOT EXISTS email_change_tokens (
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Superadmin overrides for the email copy. A row exists only for a template
+-- that has been customised; otherwise the built-in default (src/email-templates.js)
+-- is used. 'key' is one of: invite, reset, emailChange.
+CREATE TABLE IF NOT EXISTS email_templates (
+  key        TEXT PRIMARY KEY,
+  subject    TEXT NOT NULL,
+  button     TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 // ---- Self-applying migrations ---------------------------------------------

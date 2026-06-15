@@ -71,6 +71,7 @@ function renderChrome() {
   topbar.hidden = false;
   const { user } = state.me;
   $('#nav-members').hidden = false; // the members list is visible to everyone
+  $('#email-templates-btn').hidden = !user.is_superadmin;
   $('#user-menu-btn').textContent = user.email;
   // mark active nav link
   for (const a of topbar.querySelectorAll('nav a')) {
@@ -84,6 +85,7 @@ $('#user-menu-btn').addEventListener('click', (e) => {
 });
 document.addEventListener('click', () => { $('#user-menu-dropdown').hidden = true; });
 $('#edit-profile-btn').addEventListener('click', () => { location.hash = '#/profile'; });
+$('#email-templates-btn').addEventListener('click', () => { location.hash = '#/email-templates'; });
 $('#change-password-btn').addEventListener('click', () => { location.hash = '#/account'; });
 $('#logout-btn').addEventListener('click', async () => {
   await api('/logout', { method: 'POST' });
@@ -128,6 +130,7 @@ async function router() {
   if (seg === 'account') return renderAccount();
   if (seg === 'profile') return renderProfile();
   if (seg === 'u') return renderUserProfile(arg);
+  if (seg === 'email-templates') return renderEmailTemplates();
 
   // Home: the members list is the main page for everyone now.
   location.hash = '#/members';
@@ -414,13 +417,18 @@ function renderProfile() {
     $('#email-pending').innerHTML = '';
     try {
       const out = await api('/me/email', { method: 'POST', body: { new_email: newEmail } });
-      $('#profile-email').value = '';
-      if (out.verify_link) {
+      if (out.sent) {
+        $('#profile-email').value = '';
+        $('#email-pending').innerHTML = `<div class="linkbox">A confirmation link was sent to <b>${esc(newEmail)}</b>. Open it to finish the change — until then you keep signing in with <b>${esc(u.email)}</b>.</div>`;
+        toast('Confirmation email sent');
+      } else if (out.verify_link) {
+        // Dev / mail not configured: surface the link to copy.
+        $('#profile-email').value = '';
         $('#email-pending').innerHTML = linkBox(`Confirmation link for ${newEmail}`, out.verify_link);
       } else {
-        $('#email-pending').innerHTML = `<div class="linkbox">A confirmation link was sent to <b>${esc(newEmail)}</b>. Open it to finish the change — until then you keep signing in with <b>${esc(u.email)}</b>.</div>`;
+        // Mail is configured but the send didn't go through — don't claim success.
+        $('#email-error').textContent = "We couldn't send the confirmation email just now. Please check the address and try again in a moment.";
       }
-      toast('Confirmation email sent');
     } catch (err) {
       $('#email-error').textContent = err.message;
     }
@@ -646,6 +654,105 @@ async function renderMembers() {
       } catch (err) { toast(err.message, true); }
     }));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Email templates (superadmin) — edit the copy of the app's emails
+// ---------------------------------------------------------------------------
+
+function templateCardHtml(t) {
+  const chips = t.placeholders.map((p) => `<code class="chip">{{${p}}}</code>`).join(' ');
+  return `
+  <div class="card tmpl-card" data-key="${esc(t.key)}" style="margin-bottom:1.25rem">
+    <div class="tmpl-head">
+      <h2>${esc(t.label)}</h2>
+      <span class="badge ${t.is_custom ? 'invited' : 'member'}">${t.is_custom ? 'Custom' : 'Default'}</span>
+    </div>
+    <label class="field"><span>Subject</span>
+      <input type="text" class="tmpl-subject" value="${esc(t.subject)}"></label>
+    <label class="field"><span>Button label</span>
+      <input type="text" class="tmpl-button" value="${esc(t.button)}"></label>
+    <label class="field"><span>Body</span>
+      <textarea class="tmpl-body" rows="9">${esc(t.body)}</textarea></label>
+    <p class="help">Placeholders: ${chips} — keep <code class="chip">{{link}}</code> on its own line where the button goes.</p>
+    <p class="error-msg tmpl-error"></p>
+    <div class="btn-row">
+      <button class="primary tmpl-save" type="button">Save</button>
+      <button class="ghost tmpl-preview" type="button">Preview</button>
+      <button class="ghost tmpl-test" type="button">Send test to me</button>
+      <button class="link tmpl-reset" type="button"${t.is_custom ? '' : ' hidden'}>Reset to default</button>
+    </div>
+    <div class="tmpl-preview-area" hidden></div>
+  </div>`;
+}
+
+async function renderEmailTemplates() {
+  if (!state.me.user.is_superadmin) { location.hash = '#/'; return; }
+  view.innerHTML = `<div class="card"><p class="muted">Loading…</p></div>`;
+  let templates;
+  try {
+    ({ templates } = await api('/email-templates'));
+  } catch (err) {
+    view.innerHTML = `<div class="card"><p class="error-msg">${esc(err.message)}</p></div>`;
+    return;
+  }
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Email templates</h1>
+      <p>Edit the wording of the emails the app sends. Changes take effect immediately — no deploy needed.</p>
+    </div>
+    ${templates.map(templateCardHtml).join('')}`;
+
+  templates.forEach((t) => {
+    const card = view.querySelector(`.tmpl-card[data-key="${t.key}"]`);
+    const read = () => ({
+      subject: card.querySelector('.tmpl-subject').value,
+      button: card.querySelector('.tmpl-button').value,
+      body: card.querySelector('.tmpl-body').value,
+    });
+    const err = card.querySelector('.tmpl-error');
+    const setErr = (m) => { err.textContent = m || ''; };
+
+    card.querySelector('.tmpl-save').addEventListener('click', async () => {
+      setErr('');
+      try {
+        await api(`/email-templates/${t.key}`, { method: 'PUT', body: read() });
+        toast('Template saved');
+        renderEmailTemplates();
+      } catch (e) { setErr(e.message); }
+    });
+
+    card.querySelector('.tmpl-reset').addEventListener('click', async () => {
+      if (!confirm('Reset this email to the built-in default? Your customised copy will be discarded.')) return;
+      try {
+        await api(`/email-templates/${t.key}`, { method: 'DELETE' });
+        toast('Reset to default');
+        renderEmailTemplates();
+      } catch (e) { setErr(e.message); }
+    });
+
+    card.querySelector('.tmpl-preview').addEventListener('click', async () => {
+      setErr('');
+      const area = card.querySelector('.tmpl-preview-area');
+      try {
+        const r = await api(`/email-templates/${t.key}/preview`, { method: 'POST', body: read() });
+        area.hidden = false;
+        area.innerHTML = `<p class="muted" style="margin:0 0 0.4rem">Subject: <b>${esc(r.subject)}</b></p>
+          <iframe class="tmpl-iframe" sandbox=""></iframe>`;
+        area.querySelector('iframe').srcdoc = r.html;
+      } catch (e) { setErr(e.message); }
+    });
+
+    card.querySelector('.tmpl-test').addEventListener('click', async () => {
+      setErr('');
+      try {
+        const r = await api(`/email-templates/${t.key}/test`, { method: 'POST', body: read() });
+        if (r.sent) toast(`Test sent to ${r.to}`);
+        else toast(`Mail isn't configured — couldn't send (${r.reason || 'no mailer'})`, true);
+      } catch (e) { setErr(e.message); }
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------

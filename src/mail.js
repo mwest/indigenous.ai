@@ -1,6 +1,12 @@
 // Outbound email via Resend (https://resend.com) — plain fetch, no SDK needed.
 // Degrades gracefully: if RESEND_API_KEY is not set, sendMail() reports
 // {sent:false} and callers fall back to showing the action link to the admin.
+//
+// The email *copy* lives in ./email-templates.js (plain text, editable). This
+// file just renders those templates to {subject, text, html} and sends them.
+
+import templates from './email-templates.js';
+import db from './db.js';
 
 const FROM = process.env.MAIL_FROM || 'indigenous.ai <noreply@send.indigenous.ai>';
 export const APP_URL = (process.env.APP_URL || 'https://indigenous.ai').replace(/\/$/, '');
@@ -33,51 +39,82 @@ export async function sendMail({ to, subject, text, html }) {
   }
 }
 
-const wrap = (body) => `
-  <div style="font-family:sans-serif;max-width:480px;margin:0 auto;color:#222">
-    <h2 style="color:#1f2933">indigenous.ai</h2>
-    ${body}
-    <p style="color:#888;font-size:12px;margin-top:24px">
-      indigenous.ai — if you weren't expecting this email you can ignore it.</p>
-  </div>`;
+// ---- Template rendering ---------------------------------------------------
+// Variable values are HTML-escaped in the HTML body (a member controls their
+// own display name); the surrounding template prose is authored by us.
 
-// User-provided values (names, emails) rendered into HTML email bodies must be
-// escaped — a member controls their own display name.
 const escHtml = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const escAttr = (s) =>
+  String(s ?? '').replace(/[&"<>]/g, (c) => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' }[c]));
 
-export function inviteEmail({ email, link, invitedBy }) {
-  const intro = `${invitedBy} invited you to join indigenous.ai.`;
+const fillText = (str, vars) => str.replace(/\{\{(\w+)\}\}/g, (_, k) => String(vars[k] ?? ''));
+
+// Turn a plain-text body into minimal HTML: blank-line-separated paragraphs,
+// and a {{link}} line becomes a button + a plain fallback URL.
+function bodyToHtml(body, vars, button, link) {
+  const blocks = body.split(/\n\s*\n/).map((block) => {
+    if (block.trim() === '{{link}}') {
+      return `<p style="margin:24px 0 8px">` +
+        `<a href="${escAttr(link)}" style="display:inline-block;background:#1f2933;color:#fff;` +
+        `padding:11px 20px;border-radius:6px;text-decoration:none">${escHtml(button)}</a></p>` +
+        `<p style="margin:0;color:#777;font-size:13px">Or paste this link into your browser:<br>${escHtml(link)}</p>`;
+    }
+    const filled = block.replace(/\{\{(\w+)\}\}/g, (_, k) => escHtml(vars[k] ?? '')).replace(/\n/g, '<br>');
+    return `<p style="margin:0 0 16px">${filled}</p>`;
+  });
+  return `<div style="font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:15px;` +
+    `line-height:1.55;color:#222;max-width:480px">\n${blocks.join('\n')}\n</div>`;
+}
+
+// Render an arbitrary template object {subject, button, body} with `vars`.
+// Exported so the editor can preview/test unsaved copy.
+export function renderTemplateObject(t, vars) {
   return {
-    subject: `${invitedBy} invited you to indigenous.ai`,
-    text: `Hi,\n\n${intro}\n\nFollow this link to register — your email (${email}) is already filled in, so just choose a name and password:\n${link}\n\nThis invitation does not expire.\n`,
-    html: wrap(`<p>Hi,</p><p>${escHtml(intro)}</p>
-      <p>Follow the link below to register. Your email (<b>${escHtml(email)}</b>) is already filled in — just choose a name and password.</p>
-      <p><a href="${link}" style="background:#1f2933;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Register your account</a></p>
-      <p style="color:#666;font-size:13px">This invitation does not expire. Or paste this URL into your browser:<br>${link}</p>`),
+    subject: fillText(t.subject, vars),
+    text: fillText(t.body, vars),
+    html: bodyToHtml(t.body, vars, t.button, vars.link),
   };
 }
 
-export function verifyEmailChangeEmail({ name, newEmail, link }) {
-  const who = name ? `Hi ${name},` : 'Hi,';
-  return {
-    subject: 'Confirm your new indigenous.ai email address',
-    text: `${who}\n\nA request was made to change your indigenous.ai email address to ${newEmail}.\n\nConfirm it here (link valid for 2 hours) — your address won't change until you do:\n${link}\n\nIf you didn't request this, you can ignore this email and nothing will change.\n`,
-    html: wrap(`<p>${escHtml(who)}</p>
-      <p>A request was made to change your indigenous.ai email address to <b>${escHtml(newEmail)}</b>.</p>
-      <p><a href="${link}" style="background:#1f2933;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Confirm new email</a></p>
-      <p style="color:#666;font-size:13px">This link is valid for 2 hours, and your address won't change until you open it. If you didn't request this, ignore this email.</p>`),
-  };
+// Display label + the placeholders each template understands (for the editor).
+export const TEMPLATE_META = {
+  invite:      { label: 'Invitation',                placeholders: ['invitedBy', 'email', 'link'] },
+  reset:       { label: 'Password reset',            placeholders: ['greeting', 'link'] },
+  emailChange: { label: 'Email change confirmation', placeholders: ['greeting', 'newEmail', 'link'] },
+};
+
+// The built-in default copy for a template (from email-templates.js).
+export const defaultTemplate = (key) => {
+  const { subject, button, body } = templates[key];
+  return { subject, button, body };
+};
+
+// Sample values for previews / test sends.
+export function sampleVars(key) {
+  const path = key === 'emailChange' ? 'verify-email' : 'set-password';
+  const link = `${APP_URL}/#/${path}/SAMPLE-TOKEN-1234`;
+  if (key === 'invite') return { invitedBy: 'Mike', email: 'new.member@example.com', link };
+  if (key === 'reset') return { greeting: 'Hi Sam,', link };
+  return { greeting: 'Hi Sam,', newEmail: 'new.address@example.com', link };
 }
 
-export function resetEmail({ name, link }) {
-  const who = name ? `Hi ${name},` : 'Hi,';
-  return {
-    subject: 'Reset your indigenous.ai password',
-    text: `${who}\n\nSomeone (hopefully you) asked to reset your password.\n\nReset it here (link valid for 2 hours):\n${link}\n\nIf this wasn't you, you can ignore this email.\n`,
-    html: wrap(`<p>${escHtml(who)}</p><p>Someone (hopefully you) asked to reset your password.</p>
-      <p><a href="${link}" style="background:#1f2933;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Reset password</a></p>
-      <p style="color:#666;font-size:13px">This link is valid for 2 hours. If this wasn't you, ignore this email.</p>`),
-  };
+// Effective copy = superadmin override (DB) if present, else the file default.
+function effectiveTemplate(key) {
+  return db.prepare('SELECT subject, button, body FROM email_templates WHERE key = ?').get(key)
+    || templates[key];
 }
+
+const render = (name, vars) => renderTemplateObject(effectiveTemplate(name), vars);
+
+const greetingFor = (name) => (name ? `Hi ${name},` : 'Hi,');
+
+export const inviteEmail = ({ email, link, invitedBy }) =>
+  render('invite', { email, link, invitedBy });
+
+export const resetEmail = ({ name, link }) =>
+  render('reset', { greeting: greetingFor(name), link });
+
+export const verifyEmailChangeEmail = ({ name, newEmail, link }) =>
+  render('emailChange', { greeting: greetingFor(name), newEmail, link });
