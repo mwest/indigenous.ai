@@ -1,0 +1,208 @@
+/* indigenous.ai — single-page app (no build step). Clean, neutral styling. */
+:root {
+  --bg: #f5f6f7;
+  --panel: #ffffff;
+  --ink: #1f2933;
+  --muted: #6b7280;
+  --line: #e2e5e9;
+  --accent: #1f2933;
+  --accent-dark: #111820;
+  --accent-soft: #eef0f2;
+  --good: #2f7d57;
+  --danger: #b3402f;
+  --radius: 10px;
+  font-size: 16px;
+}
+
+* { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+/* ---- Top bar ---- */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.6rem 1.25rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  flex-wrap: wrap;
+}
+.brand { font-weight: 700; font-size: 1.05rem; white-space: nowrap; letter-spacing: -0.01em; }
+#topbar nav { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+#topbar nav a {
+  text-decoration: none;
+  color: var(--ink);
+  padding: 0.35rem 0.8rem;
+  border-radius: 999px;
+  font-weight: 500;
+}
+#topbar nav a.active { background: var(--accent); color: #fff; }
+#topbar nav a:hover:not(.active) { background: var(--accent-soft); }
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
+
+.user-menu { position: relative; }
+.dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+  min-width: 180px;
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+}
+.dropdown button {
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--ink);
+}
+.dropdown button:hover { background: var(--accent-soft); }
+
+/* ---- Layout ---- */
+#view { max-width: 880px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+}
+
+/* Centered card for the signed-out auth screens */
+.auth-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+.auth-card { width: 100%; max-width: 380px; }
+.auth-card .brand {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+  letter-spacing: -0.01em;
+}
+.auth-card .subtitle { color: var(--muted); margin: 0 0 1.25rem; font-size: 0.95rem; }
+
+h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+h2 { font-size: 1.1rem; margin: 0 0 0.75rem; }
+.page-head { margin-bottom: 1.25rem; }
+.page-head p { color: var(--muted); margin: 0.25rem 0 0; }
+
+/* ---- Forms ---- */
+label.field { display: block; margin-bottom: 0.9rem; }
+label.field > span { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.3rem; }
+input[type=email], input[type=password], input[type=text] {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  background: #fff;
+  color: var(--ink);
+}
+input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.55rem 1rem;
+  font-weight: 600;
+}
+button.primary { background: var(--accent); color: #fff; }
+button.primary:hover { background: var(--accent-dark); }
+button.ghost { background: none; border: 1px solid var(--line); color: var(--ink); font-weight: 500; }
+button.ghost:hover { background: var(--accent-soft); }
+button.danger { background: none; border: 1px solid var(--line); color: var(--danger); }
+button.danger:hover { background: #fbecea; border-color: var(--danger); }
+button.link { background: none; border: none; color: var(--accent); padding: 0; font-weight: 500; }
+button.link:hover { text-decoration: underline; }
+button:disabled { opacity: 0.5; cursor: default; }
+.btn-row { display: flex; gap: 0.6rem; align-items: center; margin-top: 0.5rem; }
+.full { width: 100%; }
+
+.muted { color: var(--muted); }
+.error-msg { color: var(--danger); font-size: 0.9rem; margin: 0.25rem 0 0; min-height: 1.2em; }
+.help { font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; }
+
+/* Invite link callout (shown when mail isn't configured) */
+.linkbox {
+  margin-top: 1rem;
+  padding: 0.85rem;
+  background: var(--accent-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+.linkbox code {
+  display: block;
+  margin-top: 0.4rem;
+  word-break: break-all;
+  font-size: 0.82rem;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+
+/* ---- Members table ---- */
+table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+th, td { text-align: left; padding: 0.6rem 0.5rem; border-bottom: 1px solid var(--line); }
+th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+td .row-actions { display: flex; gap: 0.4rem; justify-content: flex-end; }
+tr:last-child td { border-bottom: none; }
+tr.muted-row td { color: var(--muted); opacity: 0.7; }
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.badge.member { background: #e7f3ec; color: var(--good); }
+.badge.invited { background: var(--accent-soft); color: var(--ink); }
+.badge.deactivated { background: #f0eeec; color: var(--muted); }
+.badge.you { background: #eef2fb; color: #345; margin-left: 0.35rem; }
+
+.toolbar { display: flex; gap: 0.6rem; align-items: flex-end; flex-wrap: wrap; margin-bottom: 1.25rem; }
+.toolbar .field { margin-bottom: 0; flex: 1; min-width: 220px; }
+
+/* ---- Toast ---- */
+#toast {
+  position: fixed;
+  bottom: 1.25rem;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent-dark);
+  color: #fff;
+  padding: 0.65rem 1.1rem;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  z-index: 50;
+  max-width: 90vw;
+}
+#toast.error { background: var(--danger); }

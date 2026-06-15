@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>indigenous.ai</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231f2933'/></svg>">
+</head>
+<body>
+  <header id="topbar" hidden>
+    <div class="brand">indigenous.ai</div>
+    <nav>
+      <a href="#/members" data-nav="members" id="nav-members" hidden>Members</a>
+    </nav>
+    <div class="topbar-right">
+      <div class="user-menu">
+        <button id="user-menu-btn" class="ghost"></button>
+        <div id="user-menu-dropdown" class="dropdown" hidden>
+          <button id="edit-profile-btn">Edit profile</button>
+          <button id="change-password-btn">Change password</button>
+          <button id="logout-btn">Sign out</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="view"></main>
+
+  <div id="toast" hidden></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

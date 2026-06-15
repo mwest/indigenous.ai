@@ -1,0 +1,19 @@
+{
+  "name": "indigenous-ai",
+  "version": "1.0.0",
+  "description": "indigenous.ai — minimal user system (auth, invites, password reset)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "create-superadmin": "node scripts/create-superadmin.js",
+    "smoke-test": "node scripts/smoke-test.js"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.10.0",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.2.1"
+  }
+}
