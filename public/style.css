@@ -188,6 +188,49 @@ tr.muted-row td { color: var(--muted); opacity: 0.7; }
 .badge.deactivated { background: #f0eeec; color: var(--muted); }
 .badge.you { background: #eef2fb; color: #345; margin-left: 0.35rem; }
 
+/* ---- Avatars ---- */
+.avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  vertical-align: middle;
+  overflow: hidden;
+}
+.avatar-initial { color: var(--accent); font-weight: 700; font-size: 0.85rem; }
+.avatar-lg { width: 96px; height: 96px; font-size: 2.4rem; }
+.member-cell { display: inline-flex; align-items: center; gap: 0.6rem; }
+.member-cell a { color: var(--ink); text-decoration: none; font-weight: 500; }
+.member-cell a:hover { text-decoration: underline; }
+
+/* ---- Profile editor & view ---- */
+textarea {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: inherit;
+  background: #fff;
+  color: var(--ink);
+  resize: vertical;
+}
+textarea:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+.avatar-edit { display: flex; align-items: center; gap: 1rem; margin: 0.75rem 0 1.25rem; }
+.avatar-edit-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 0.4rem; }
+.checkbox-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.35rem; cursor: pointer; }
+.checkbox-row input { width: auto; }
+.checkbox-row span { font-size: 0.95rem; }
+.profile-view { text-align: center; max-width: 460px; margin: 0 auto; }
+.profile-view .avatar-lg { margin: 0 auto 0.25rem; }
+.profile-view h1 { margin: 0.5rem 0 0; }
+.profile-view .handle { margin-top: 0.15rem; }
+.profile-view .about { white-space: pre-wrap; margin-top: 1rem; text-align: left; }
+
 .toolbar { display: flex; gap: 0.6rem; align-items: flex-end; flex-wrap: wrap; margin-bottom: 1.25rem; }
 .toolbar .field { margin-bottom: 0; flex: 1; min-width: 220px; }
 

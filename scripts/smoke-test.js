@@ -18,14 +18,14 @@ function check(name, cond, detail = '') {
 function client() {
   let cookie = '';
   return {
-    async req(method, path, body) {
+    async req(method, path, body, isForm = false) {
       const res = await fetch(BASE + path, {
         method,
         headers: {
           ...(cookie ? { Cookie: cookie } : {}),
-          ...(body ? { 'Content-Type': 'application/json' } : {}),
+          ...(body && !isForm ? { 'Content-Type': 'application/json' } : {}),
         },
-        body: body ? JSON.stringify(body) : undefined,
+        body: body ? (isForm ? body : JSON.stringify(body)) : undefined,
         redirect: 'manual',
       });
       const setCookie = res.headers.get('set-cookie');
@@ -253,6 +253,68 @@ check('old email no longer logs in', r.status === 401);
 
 r = await verifier.req('POST', '/api/email/verify', { token: emailToken });
 check('verify token is single-use', r.status === 404);
+
+// --- opt-in public profile (username, picture, about, visibility) ---
+r = await prof.req('POST', '/api/me/profile', { username: 'ab' });
+check('username too short rejected', r.status === 400);
+r = await prof.req('POST', '/api/me/profile', { username: 'bad name!' });
+check('username with invalid chars rejected', r.status === 400);
+
+const handle = `prof_${Date.now()}`;
+r = await prof.req('POST', '/api/me/profile', { username: handle, about: 'Hi, I am Prof.' });
+check('set username + about', r.status === 200 && r.data.username === handle, JSON.stringify(r.data));
+
+r = await member.req('GET', `/api/profiles/${handle}`);
+check('hidden profile is 404 to other members', r.status === 404);
+r = await prof.req('GET', `/api/profiles/${handle}`);
+check('owner can view their own hidden profile',
+  r.status === 200 && r.data.is_self === true && r.data.visible === false, JSON.stringify(r.data));
+
+r = await prof.req('POST', '/api/me/profile', { visible: true });
+check('make profile visible', r.status === 200 && r.data.visible === true, JSON.stringify(r.data));
+r = await member.req('GET', `/api/profiles/${handle}`);
+check('visible profile readable by another member',
+  r.status === 200 && r.data.username === handle && r.data.about === 'Hi, I am Prof.', JSON.stringify(r.data));
+
+r = await member.req('POST', '/api/me/profile', { username: handle });
+check('duplicate username rejected', r.status === 400, JSON.stringify(r.data));
+
+const noNameEmail = `noname${Date.now()}@example.com`;
+r = await sa.req('POST', '/api/members', { email: noNameEmail });
+const noName = client();
+await noName.req('POST', '/api/password/reset',
+  { token: tokenFromLink(r.data.invite_link), name: 'No Name', password: 'noname-pass-1' });
+await noName.req('POST', '/api/login', { email: noNameEmail, password: 'noname-pass-1' });
+r = await noName.req('POST', '/api/me/profile', { visible: true });
+check('cannot become visible without a username',
+  r.status === 400 && /username/i.test(r.data.error), JSON.stringify(r.data));
+
+// avatar upload + access control
+const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64');
+const fd = new FormData();
+fd.append('avatar', new Blob([png], { type: 'image/png' }), 'a.png');
+r = await prof.req('POST', '/api/me/avatar', fd, true);
+check('avatar upload (PNG)', r.status === 200, JSON.stringify(r.data));
+r = await prof.req('GET', '/api/me/avatar');
+check('owner fetches own avatar', r.status === 200);
+r = await member.req('GET', `/api/profiles/${handle}/avatar`);
+check('member fetches a visible avatar', r.status === 200);
+r = await prof.req('GET', `/api/profiles/${handle}`);
+check('profile reports has_avatar', r.data.has_avatar === true, JSON.stringify(r.data));
+const loggedOut = client();
+r = await loggedOut.req('GET', `/api/profiles/${handle}/avatar`);
+check('logged-out cannot fetch avatar', r.status === 401);
+
+// opt out keeps the data but hides it from others
+r = await prof.req('POST', '/api/me/profile', { visible: false });
+check('opt out of visibility', r.status === 200 && r.data.visible === false, JSON.stringify(r.data));
+r = await prof.req('GET', '/api/me');
+check('opt-out keeps username + about + avatar', r.data.user.username === handle &&
+  r.data.user.about === 'Hi, I am Prof.' && r.data.user.has_avatar === true, JSON.stringify(r.data.user));
+r = await member.req('GET', `/api/profiles/${handle}`);
+check('opted-out profile hidden from others again', r.status === 404);
+r = await member.req('GET', `/api/profiles/${handle}/avatar`);
+check('opted-out avatar hidden from others', r.status === 404);
 
 // --- resend invite (new invited member) ---
 const pendingEmail = `pending${Date.now()}@example.com`;

@@ -10,10 +10,11 @@ class ApiError extends Error {
 }
 
 async function api(path, opts = {}) {
+  const isForm = opts.body instanceof FormData;
   const res = await fetch('/api' + path, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: isForm ? {} : { 'Content-Type': 'application/json' },
     ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    body: isForm ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (res.status === 401 && path !== '/login') {
     // Session expired or not signed in — but a 401 from the login attempt
@@ -126,6 +127,7 @@ async function router() {
   if (seg === 'members') return renderMembers();
   if (seg === 'account') return renderAccount();
   if (seg === 'profile') return renderProfile();
+  if (seg === 'u') return renderUserProfile(arg);
 
   // Home: the members list is the main page for everyone now.
   location.hash = '#/members';
@@ -309,7 +311,30 @@ function linkBox(label, link) {
 }
 
 // ---------------------------------------------------------------------------
-// Edit profile: update name, and change email (verified via emailed link)
+// Avatars
+// ---------------------------------------------------------------------------
+
+let avatarBust = Date.now(); // bumped after an avatar change to defeat caching
+
+const initialFor = (s) => esc((String(s || '?').trim()[0] || '?').toUpperCase());
+
+// The current user's own avatar (works before a username is set).
+function ownAvatarHtml(u) {
+  if (u.has_avatar) return `<img class="avatar avatar-lg" src="/api/me/avatar?v=${avatarBust}" alt="Your picture">`;
+  return `<span class="avatar avatar-lg avatar-initial">${initialFor(u.name || u.email)}</span>`;
+}
+
+// Another member's avatar by username (or initials fallback).
+function avatarCircle(m, lg = false) {
+  const cls = `avatar${lg ? ' avatar-lg' : ''}`;
+  if (m.username && m.has_avatar) {
+    return `<img class="${cls}" src="/api/profiles/${encodeURIComponent(m.username)}/avatar" alt="">`;
+  }
+  return `<span class="${cls} avatar-initial">${initialFor(m.name || m.email)}</span>`;
+}
+
+// ---------------------------------------------------------------------------
+// Edit profile: name, email (verified), and the opt-in public profile
 // ---------------------------------------------------------------------------
 
 function renderProfile() {
@@ -336,6 +361,31 @@ function renderProfile() {
         <button class="primary" type="submit">Change email</button>
       </form>
       <div id="email-pending"></div>
+    </div>
+    <div class="card auth-card" style="margin:1.25rem 0 0">
+      <h2>Public profile</h2>
+      <p class="muted" style="margin-top:-0.4rem">Opt in to show a profile — picture, username, and About Me — to other signed-in members.</p>
+      <div class="avatar-edit">
+        ${ownAvatarHtml(u)}
+        <div class="avatar-edit-actions">
+          <input type="file" id="avatar-input" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+          <button class="ghost" type="button" id="avatar-upload-btn">Upload picture</button>
+          ${u.has_avatar ? `<button class="link" type="button" id="avatar-remove-btn">Remove</button>` : ''}
+        </div>
+      </div>
+      <form id="profile-form">
+        <label class="field"><span>Username</span>
+          <input type="text" id="profile-username" value="${esc(u.username || '')}" placeholder="your_handle"
+            autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="field"><span>About me</span>
+          <textarea id="profile-about" rows="4" maxlength="500" placeholder="A short bio">${esc(u.about || '')}</textarea></label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="profile-visible" ${u.visible ? 'checked' : ''}>
+          <span>Show my profile to other members</span></label>
+        <p class="help">Turning this off hides your profile but keeps your username, picture, and About Me.</p>
+        <p class="error-msg" id="profile-error"></p>
+        <button class="primary" type="submit">Save profile</button>
+      </form>
     </div>`;
 
   $('#name-form').addEventListener('submit', async (e) => {
@@ -376,6 +426,73 @@ function renderProfile() {
     }
     btn.disabled = false;
   });
+
+  // --- avatar (uploaded / removed immediately) ---
+  $('#avatar-upload-btn').addEventListener('click', () => $('#avatar-input').click());
+  $('#avatar-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('avatar', file);
+    try {
+      await api('/me/avatar', { method: 'POST', body: fd });
+      avatarBust = Date.now();
+      await loadMe();
+      toast('Picture updated');
+      renderProfile();
+    } catch (err) { toast(err.message, true); }
+  });
+  const removeBtn = $('#avatar-remove-btn');
+  if (removeBtn) removeBtn.addEventListener('click', async () => {
+    try {
+      await api('/me/avatar', { method: 'DELETE' });
+      await loadMe();
+      toast('Picture removed');
+      renderProfile();
+    } catch (err) { toast(err.message, true); }
+  });
+
+  // --- username / about / visibility ---
+  $('#profile-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button[type=submit]');
+    btn.disabled = true;
+    $('#profile-error').textContent = '';
+    try {
+      const out = await api('/me/profile', { method: 'POST', body: {
+        username: $('#profile-username').value,
+        about: $('#profile-about').value,
+        visible: $('#profile-visible').checked,
+      } });
+      await loadMe();
+      toast(out.visible ? 'Profile saved — visible to members' : 'Profile saved');
+      renderProfile();
+    } catch (err) {
+      $('#profile-error').textContent = err.message;
+      btn.disabled = false;
+    }
+  });
+}
+
+async function renderUserProfile(username) {
+  view.innerHTML = `<div class="card"><p class="muted">Loading…</p></div>`;
+  let p;
+  try {
+    p = await api('/profiles/' + encodeURIComponent(username));
+  } catch (err) {
+    view.innerHTML = `<div class="card">
+      <p class="error-msg">${esc(err.message)}</p>
+      <p style="margin-top:1rem"><a href="#/members">← Back to members</a></p></div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="card profile-view">
+      ${avatarCircle({ username: p.username, has_avatar: p.has_avatar, name: p.name }, true)}
+      <h1>${esc(p.name || '')}</h1>
+      <p class="muted handle">@${esc(p.username)}${p.is_self && !p.visible ? ' · only visible to you (profile hidden)' : ''}</p>
+      ${p.about ? `<p class="about">${esc(p.about)}</p>` : '<p class="muted">Nothing here yet.</p>'}
+      <p style="margin-top:1.5rem"><a href="#/members">← Members</a></p>
+    </div>`;
 }
 
 async function renderVerifyEmail(token) {
@@ -434,9 +551,16 @@ async function renderMembers() {
     if (m.status === 'deactivated') return `<button class="ghost" data-reactivate="${m.id}" data-email="${esc(m.email)}">Reactivate</button>`;
     return `<button class="danger" data-deactivate="${m.id}" data-email="${esc(m.email)}">Deactivate</button>`;
   };
+  // Name cell shows the round avatar; opted-in members link to their profile.
+  const nameCell = (m) => {
+    const text = m.name ? esc(m.name) : '<span class="muted">—</span>';
+    const name = m.username ? `<a href="#/u/${encodeURIComponent(m.username)}">${text}</a>` : text;
+    const you = m.id === meId ? '<span class="badge you">you</span>' : '';
+    return `<td><span class="member-cell">${avatarCircle(m)}<span>${name}${you}</span></span></td>`;
+  };
   const rows = members.map((m) => `
     <tr${m.status === 'deactivated' ? ' class="muted-row"' : ''}>
-      <td>${m.name ? esc(m.name) : '<span class="muted">—</span>'}${m.id === meId ? '<span class="badge you">you</span>' : ''}</td>
+      ${nameCell(m)}
       <td>${esc(m.email)}</td>
       ${isSuper ? `<td><span class="badge ${m.status}">${STATUS_LABEL[m.status] ?? esc(m.status)}</span></td>
       <td><div class="row-actions">${rowActions(m)}</div></td>` : ''}

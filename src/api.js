@@ -1,7 +1,10 @@
 import express from 'express';
+import multer from 'multer';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
-import db from './db.js';
+import db, { AVATAR_DIR } from './db.js';
 import { APP_URL, inviteEmail, resetEmail, sendMail, verifyEmailChangeEmail } from './mail.js';
 import {
   COOKIE_NAME,
@@ -173,7 +176,17 @@ api.post('/email/verify', (req, res) => {
 api.use(requireAuth); // everything below requires a session
 
 api.get('/me', (req, res) => {
-  res.json({ user: req.user });
+  const u = db
+    .prepare(`SELECT id, email, name, is_superadmin, username, about, profile_visible, avatar_ext
+              FROM users WHERE id = ?`)
+    .get(req.user.id);
+  res.json({
+    user: {
+      id: u.id, email: u.email, name: u.name, is_superadmin: u.is_superadmin,
+      username: u.username, about: u.about,
+      visible: !!u.profile_visible, has_avatar: !!u.avatar_ext,
+    },
+  });
 });
 
 api.post('/me/password', (req, res) => {
@@ -225,6 +238,141 @@ api.post('/me/email', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Opt-in public profile (visible to other signed-in members)
+// ---------------------------------------------------------------------------
+
+const USERNAME_RE = /^[a-z0-9_]{3,30}$/i;
+const ABOUT_MAX = 500;
+const AVATAR_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const AVATAR_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+};
+
+// Update profile text fields together. Toggling visibility keeps the other
+// fields; you must have a username before the profile can be made visible.
+api.post('/me/profile', (req, res) => {
+  const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  const { username, about, visible } = req.body ?? {};
+
+  let newUsername = me.username;
+  if (username !== undefined) {
+    const u = String(username).trim();
+    if (u === '') {
+      newUsername = null;
+    } else if (!USERNAME_RE.test(u)) {
+      return bad(res, 'Username must be 3–30 characters: letters, numbers, or underscores');
+    } else {
+      if (db.prepare('SELECT 1 FROM users WHERE username = ? COLLATE NOCASE AND id != ?').get(u, me.id)) {
+        return bad(res, 'That username is taken');
+      }
+      newUsername = u;
+    }
+  }
+
+  let newAbout = me.about;
+  if (about !== undefined) newAbout = String(about).trim().slice(0, ABOUT_MAX) || null;
+
+  let newVisible = me.profile_visible;
+  if (visible !== undefined) newVisible = visible ? 1 : 0;
+
+  if (newVisible && !newUsername) {
+    return bad(res, 'Choose a username before making your profile visible');
+  }
+
+  db.prepare('UPDATE users SET username = ?, about = ?, profile_visible = ? WHERE id = ?')
+    .run(newUsername, newAbout, newVisible, me.id);
+  res.json({ ok: true, username: newUsername, about: newAbout, visible: !!newVisible });
+});
+
+const avatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, AVATAR_DIR),
+    filename: (req, file, cb) => cb(null, `${req.user.id}${path.extname(file.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!AVATAR_EXTS.has(path.extname(file.originalname).toLowerCase())) {
+      return cb(new Error('Use a PNG, JPG, WebP, or GIF image'));
+    }
+    cb(null, true);
+  },
+});
+
+function sendAvatar(res, userId, ext) {
+  res.sendFile(path.join(AVATAR_DIR, `${userId}.${ext}`), {
+    headers: {
+      'Content-Type': AVATAR_MIME[ext] || 'application/octet-stream',
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-cache',
+    },
+  });
+}
+
+// Own avatar (works even before a username is set, for the editor preview).
+api.get('/me/avatar', (req, res) => {
+  const u = db.prepare('SELECT id, avatar_ext FROM users WHERE id = ?').get(req.user.id);
+  if (!u.avatar_ext) return bad(res, 'No avatar', 404);
+  sendAvatar(res, u.id, u.avatar_ext);
+});
+
+api.post('/me/avatar', (req, res) => {
+  avatarUpload.single('avatar')(req, res, (err) => {
+    if (err) {
+      return bad(res, err.code === 'LIMIT_FILE_SIZE' ? 'Image must be under 2 MB' : err.message);
+    }
+    if (!req.file) return bad(res, 'No image provided');
+    const newExt = path.extname(req.file.filename).slice(1).toLowerCase();
+    const me = db.prepare('SELECT avatar_ext FROM users WHERE id = ?').get(req.user.id);
+    // A different extension means a different file name — remove the stale one.
+    if (me.avatar_ext && me.avatar_ext !== newExt) {
+      fs.rm(path.join(AVATAR_DIR, `${req.user.id}.${me.avatar_ext}`), { force: true }, () => {});
+    }
+    db.prepare('UPDATE users SET avatar_ext = ? WHERE id = ?').run(newExt, req.user.id);
+    res.json({ ok: true });
+  });
+});
+
+api.delete('/me/avatar', (req, res) => {
+  const me = db.prepare('SELECT avatar_ext FROM users WHERE id = ?').get(req.user.id);
+  if (me.avatar_ext) {
+    fs.rm(path.join(AVATAR_DIR, `${req.user.id}.${me.avatar_ext}`), { force: true }, () => {});
+    db.prepare('UPDATE users SET avatar_ext = NULL WHERE id = ?').run(req.user.id);
+  }
+  res.json({ ok: true });
+});
+
+// A member's public profile — visible only if they've opted in (or it's you).
+function loadVisibleProfile(req) {
+  const u = db
+    .prepare(`SELECT id, name, username, about, avatar_ext, profile_visible
+              FROM users WHERE username = ? COLLATE NOCASE AND deactivated_at IS NULL`)
+    .get(req.params.username);
+  if (!u || !u.username) return null;
+  const isSelf = u.id === req.user.id;
+  if (!u.profile_visible && !isSelf) return null;
+  return { ...u, isSelf };
+}
+
+api.get('/profiles/:username', (req, res) => {
+  const u = loadVisibleProfile(req);
+  if (!u) return bad(res, 'Profile not found', 404);
+  res.json({
+    name: u.name,
+    username: u.username,
+    about: u.about,
+    has_avatar: !!u.avatar_ext,
+    visible: !!u.profile_visible,
+    is_self: u.isSelf,
+  });
+});
+
+api.get('/profiles/:username/avatar', (req, res) => {
+  const u = loadVisibleProfile(req);
+  if (!u || !u.avatar_ext) return bad(res, 'Not found', 404);
+  sendAvatar(res, u.id, u.avatar_ext);
+});
+
+// ---------------------------------------------------------------------------
 // Members — every signed-in user can see the list and invite (quota-limited)
 // ---------------------------------------------------------------------------
 
@@ -242,6 +390,7 @@ const invitesUsed = (userId) =>
 //   'deactivated' — turned off by a superadmin (never deleted)
 const memberSelect = `
   SELECT u.id, u.email, u.name, u.created_at,
+         u.username, u.avatar_ext, u.profile_visible,
          CASE
            WHEN u.deactivated_at IS NOT NULL THEN 'deactivated'
            WHEN u.password_hash IS NOT NULL THEN 'member'
@@ -263,12 +412,18 @@ api.get('/members', (req, res) => {
   const isSuper = !!req.user.is_superadmin;
   // The superadmin sees everyone (with status) so they can manage accounts;
   // regular members see only active, registered members and no status.
-  const members = isSuper
+  const rows = isSuper
     ? db.prepare(`${memberSelect}
          ORDER BY (u.deactivated_at IS NOT NULL), u.name IS NULL, u.name, u.email`).all()
-    : db.prepare(`SELECT id, name, email FROM users
+    : db.prepare(`SELECT id, name, email, username, avatar_ext, profile_visible FROM users
          WHERE password_hash IS NOT NULL AND deactivated_at IS NULL
          ORDER BY name IS NULL, name, email`).all();
+  // A member's profile handle/avatar are exposed only if they've opted in.
+  const members = rows.map(({ avatar_ext, profile_visible, username, ...m }) => ({
+    ...m,
+    username: profile_visible ? username : null,
+    has_avatar: profile_visible ? !!avatar_ext : false,
+  }));
   const used = invitesUsed(req.user.id);
   res.json({
     members,
