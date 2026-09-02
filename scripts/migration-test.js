@@ -39,13 +39,20 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
-  check('fresh: baseline recorded in schema_migrations',
-    applied.length === 1 && applied[0].name === '001_baseline', JSON.stringify(applied));
-  check('fresh: checksum recorded', !!applied[0].checksum && applied[0].checksum.length === 64);
+  check('fresh: migrations recorded in schema_migrations',
+    applied.length === 2 && applied[0].name === '001_baseline' && applied[1].name === '002_languages',
+    JSON.stringify(applied));
+  check('fresh: checksums recorded', applied.every((m) => m.checksum?.length === 64));
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map((t) => t.name);
-  for (const t of ['users', 'organizations', 'organization_apps', 'work_items', 'work_log', 'audio_files']) {
+  for (const t of ['users', 'organizations', 'organization_apps', 'work_items', 'work_log', 'audio_files',
+                   'languages', 'language_varieties', 'orthographies', 'entry_texts']) {
     check(`fresh: table ${t} exists`, tables.includes(t));
   }
+  check('fresh: English and Dene languages seeded',
+    db.prepare(`SELECT COUNT(*) n FROM languages WHERE name IN ('English','Dene')`).get().n === 2);
+  check('fresh: English variety seeded with a uid',
+    !!db.prepare(`SELECT 1 FROM language_varieties v JOIN languages l ON l.id=v.language_id
+                  WHERE l.code='en' AND v.uid IS NOT NULL`).get());
   check('fresh: foreign_key_check clean', db.pragma('foreign_key_check').length === 0);
   db.close();
 }
@@ -112,8 +119,8 @@ r = apply(legacyDir);
 check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
-  check('legacy: baseline recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 1);
+  check('legacy: both migrations recorded',
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 2);
   check('legacy: users preserved', db.prepare(`SELECT COUNT(*) n FROM users`).get().n === 1);
   check('legacy: entries preserved with text intact',
     db.prepare(`SELECT COUNT(*) n FROM entries`).get().n === 2 &&
@@ -138,6 +145,21 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
     !!db.prepare(`SELECT 1 FROM sqlite_master WHERE name='idx_audio_current_one_per_lang'`).get());
   check('legacy: work_items/work_log tables created',
     !!tableSql(db, 'work_items') && !!tableSql(db, 'work_log'));
+  // 002: entry_texts backfill — both fixture entries have both sides.
+  check('legacy: entry_texts backfilled (2 entries -> 4 texts, all with uids)',
+    db.prepare(`SELECT COUNT(*) n FROM entry_texts WHERE uid IS NOT NULL`).get().n === 4);
+  check('legacy: primary text equals the Dene column, in the project-dialect variety',
+    db.prepare(`SELECT et.text, v.name AS variety, l.name AS language FROM entry_texts et
+                JOIN language_varieties v ON v.id = et.variety_id
+                JOIN languages l ON l.id = v.language_id
+                WHERE et.entry_id = 1 AND et.is_primary = 1`).get()?.text === 'ʔedlánet’é' &&
+    db.prepare(`SELECT v.name FROM entry_texts et JOIN language_varieties v ON v.id = et.variety_id
+                WHERE et.entry_id = 1 AND et.is_primary = 1`).get()?.name === 'Dëne Sųłıné');
+  check('legacy: English side stored as a role=translation text in the English variety',
+    db.prepare(`SELECT et.text FROM entry_texts et
+                JOIN language_varieties v ON v.id = et.variety_id
+                JOIN languages l ON l.id = v.language_id
+                WHERE et.entry_id = 1 AND l.code = 'en' AND et.role = 'translation'`).get()?.text === 'how are you');
   check('legacy: foreign_key_check clean', db.pragma('foreign_key_check').length === 0);
   db.close();
 }

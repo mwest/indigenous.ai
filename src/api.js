@@ -8,6 +8,7 @@ import { parseFile } from 'music-metadata';
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor, orgRole, orgsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, classifyArchive } from './audio.js';
+import { syncEntryTexts } from './apps/language/texts.js';
 import { createRequire } from 'node:module';
 import { backfillEmbeddings } from '../scripts/embed-backfill.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
@@ -1027,8 +1028,20 @@ language.get('/projects/:id/stats', (req, res) => {
 // Audio visibility: every member of a project can see and play all recordings
 // on that project's entries. Editing/deleting a recording remains restricted
 // to its uploader or a project admin.
+// Reads PREFER entry_texts (plan §6): the two bilingual columns surfaced to
+// the UI are resolved from the entry's primary text and its English
+// role='translation' text, falling back to the legacy synced columns (kept
+// equal by syncEntryTexts during the compatibility window).
 const entrySelect = `
-  SELECT e.id, e.project_id, e.kind, e.dene_text, e.english_text, e.source_doc,
+  SELECT e.id, e.project_id, e.kind,
+         COALESCE((SELECT et.text FROM entry_texts et
+                    WHERE et.entry_id = e.id AND et.is_primary = 1), e.dene_text) AS dene_text,
+         COALESCE((SELECT et.text FROM entry_texts et
+                    JOIN language_varieties lv ON lv.id = et.variety_id
+                    JOIN languages l ON l.id = lv.language_id
+                    WHERE et.entry_id = e.id AND l.code = 'en' AND et.role = 'translation'
+                    ORDER BY et.id LIMIT 1), e.english_text) AS english_text,
+         e.source_doc,
          e.notes, e.category, e.status, e.created_by, e.updated_by,
          e.created_at, e.updated_at,
          p.name AS project_name, p.dialect,
@@ -1222,6 +1235,7 @@ function applyTranslation(entry, nextDene, nextEnglish, userId) {
     `UPDATE entries SET dene_text = ?, english_text = ?, updated_by = ?, updated_at = datetime('now')
      WHERE id = ?`
   ).run(nextDene, nextEnglish, userId, entry.id);
+  syncEntryTexts(db, entry.id, userId);
   if (nextEnglish !== entry.english_text) storeEmbedding(entry.id, nextEnglish);
 }
 
@@ -1249,6 +1263,7 @@ language.post('/entries', (req, res) => {
     )
     .run(projectId, kind, dene, english, source_doc?.trim() || null,
          notes?.trim() || null, category?.trim() || null, req.user.id, req.user.id);
+  syncEntryTexts(db, info.lastInsertRowid, req.user.id);
   storeEmbedding(info.lastInsertRowid, english);
   const entry = db
     .prepare(`${entrySelect} WHERE e.id = ?`)
@@ -1296,6 +1311,7 @@ language.patch('/entries/:id', loadEntry, (req, res) => {
     req.user.id,
     req.entry.id
   );
+  syncEntryTexts(db, req.entry.id, req.user.id);
   if (nextEnglish !== req.entry.english_text) storeEmbedding(req.entry.id, nextEnglish);
   res.json(
     db.prepare(`${entrySelect} WHERE e.id = ?`).get(...entryParams(req.user), req.entry.id)
@@ -2392,7 +2408,8 @@ language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next)
       const key = JSON.stringify([dene, english]);
       if (seen.has(key)) { skippedDuplicates++; continue; }
       seen.add(key);
-      insert.run(project.id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
+      const row = insert.run(project.id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
+      syncEntryTexts(db, row.lastInsertRowid, req.user.id);
       imported++;
     }
   })();
