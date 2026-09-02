@@ -17,6 +17,13 @@ delete env.NODE_ENV; // dev behavior: _test_lease_seconds etc. must work
 
 console.log(`[test] data dir: ${dataDir}`);
 
+// 0. Migration framework tests (fresh + legacy databases, rollback, rerun,
+// downgrade refusal) — they manage their own temp dirs.
+const mig = spawnSync(process.execPath, ['scripts/migration-test.js'], {
+  env: process.env, stdio: 'inherit',
+});
+if (mig.status !== 0) { console.error('[test] migration tests failed'); process.exit(1); }
+
 // 1. Bootstrap the superadmin in the throwaway DB.
 const boot = spawnSync(process.execPath, ['scripts/create-superadmin.js', EMAIL, 'CI Admin', PASS], {
   env, stdio: 'inherit',

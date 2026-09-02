@@ -183,6 +183,28 @@ the model alongside Node + SQLite.
 
 Back up by copying the `data/` directory.
 
+## Database migrations
+
+Schema changes are versioned migrations in `migrations/` (`NNN_name.sql` or
+`NNN_name.js` exporting `up(db)`), applied in numeric order at boot and recorded
+(with checksums) in `schema_migrations`. Each migration runs exactly once, inside
+a transaction (a `.js` migration may export `transaction = false` to manage its
+own — required when toggling `PRAGMA foreign_keys` for a table rebuild). A failed
+migration rolls back and the app refuses to start; the app also refuses to run
+against a database whose recorded schema is newer than the code knows.
+
+`001_baseline` builds the full current schema on fresh databases and upgrades any
+historical database (back to day one) in place — restored old backups are safe.
+Applied migration files are frozen; put changes in a new numbered file.
+
+```powershell
+npm run migrations:status     # applied + pending, without applying anything
+npm run test:migrations       # fresh/legacy/rollback/rerun/downgrade tests
+```
+
+`npm test` runs the migration tests first, then the full smoke suite; CI runs
+both on every change.
+
 ## API
 
 JSON API with cookie sessions, split by module. Highlights:
