@@ -15,7 +15,9 @@ const PRIMARY_HOST = new URL(APP_URL).hostname;
 // Hostnames that should bounce to the primary origin (the old Dene Voice
 // Library host, kept as a redirect only — it is not part of the architecture).
 const LEGACY_HOSTS = new Set(
-  (process.env.LEGACY_HOSTS || 'app.dene.ca').split(',').map((h) => h.trim()).filter(Boolean)
+  // ?? not ||: an explicitly empty LEGACY_HOSTS disables the redirect (used
+  // while indigenous.ai DNS is not live yet, so app.dene.ca keeps serving).
+  (process.env.LEGACY_HOSTS ?? 'app.dene.ca').split(',').map((h) => h.trim()).filter(Boolean)
 );
 
 const app = express();
