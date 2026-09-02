@@ -44,12 +44,10 @@ app.use((req, res, next) => {
 app.use('/api/platform', platform);
 app.use('/api/language', language);
 
-// Product root: brand home / sign-in entry / route into Language.
-app.get('/', (req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'landing.html'), {
-    headers: { 'Cache-Control': 'no-cache' },
-  });
-});
+// Product root: straight into the app. The SPA shows the sign-in screen when
+// there is no session and the user's app (Language — the only one today)
+// when there is; old #/route bookmarks survive the redirect client-side.
+app.get('/', (req, res) => res.redirect('/language'));
 
 // The Language application (SPA) lives at /language.
 // no-cache (revalidate every load) for code and markup so deploys show up
@@ -69,8 +67,8 @@ app.get('/language/{*splat}', (req, res) => {
     headers: { 'Cache-Control': 'no-cache' },
   });
 });
-// Anything else on the primary origin goes to the landing page.
-app.get('/{*splat}', (req, res) => res.redirect('/'));
+// Anything else on the primary origin goes to the app too.
+app.get('/{*splat}', (req, res) => res.redirect('/language'));
 
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
 

@@ -428,7 +428,7 @@ function renderLogin() {
   setActiveNav('');
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Indigenous.ai — Language</div>
+      <div class="brand-big">indigenous.ai</div>
       <div class="card">
         <form id="login-form">
           <label class="field"><span>Email</span>
@@ -441,9 +441,7 @@ function renderLogin() {
             <a href="#/forgot" style="font-size:0.9rem">Forgot your password?</a></p>
         </form>
       </div>
-      <p class="login-note">Accounts are created by your project admin.<br>
-      Looking for a translation? <a href="#/request">Submit a request</a>.<br>
-      Indigenous.ai</p>
+      <p class="login-note">Accounts are created by your project admin.</p>
     </div>`;
   $('#login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -465,7 +463,7 @@ function renderForgot() {
   renderTopbar();
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Indigenous.ai — Language</div>
+      <div class="brand-big">indigenous.ai</div>
       <div class="card">
         <form id="forgot-form">
           <p>Enter your account email and we’ll send you a link to reset your password.</p>
@@ -493,7 +491,7 @@ function renderSetPassword(token) {
   renderTopbar();
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Indigenous.ai — Language</div>
+      <div class="brand-big">indigenous.ai</div>
       <div class="card" id="setpw-card"><p>Checking your link…</p></div>
     </div>`;
   (async () => {
@@ -538,7 +536,7 @@ function renderRequestStart() {
   renderTopbar();
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Indigenous.ai — Language</div>
+      <div class="brand-big">indigenous.ai</div>
       <div class="card">
         <form id="request-start-form">
           <p>Looking for a Dene translation? Enter your email and we’ll send you a
@@ -570,7 +568,7 @@ function renderRequestForm(token) {
   renderTopbar();
   view.innerHTML = `
     <div class="request-wrap">
-      <div class="brand-big">🪶 Indigenous.ai — Language</div>
+      <div class="brand-big">indigenous.ai</div>
       <div class="card" id="request-card"><p>Checking your link…</p></div>
     </div>`;
   (async () => {
