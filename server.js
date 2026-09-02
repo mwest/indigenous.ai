@@ -28,7 +28,12 @@ app.use(cookieParser());
 
 // Legacy hosts redirect to the Language app on the primary origin. Old
 // SPA bookmarks keep working: the #/route fragment is reattached client-side.
+// www canonicalizes to the apex (path preserved) so there is one origin —
+// no duplicate cookie scope or split sessions.
 app.use((req, res, next) => {
+  if (req.hostname === `www.${PRIMARY_HOST}` && req.method === 'GET') {
+    return res.redirect(301, APP_URL + req.originalUrl);
+  }
   if (LEGACY_HOSTS.has(req.hostname) && req.hostname !== PRIMARY_HOST && req.method === 'GET') {
     return res.redirect(301, `${APP_URL}/language`);
   }
