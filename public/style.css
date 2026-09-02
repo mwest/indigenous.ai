@@ -40,8 +40,16 @@ body {
   flex-wrap: wrap;
 }
 .brand { font-weight: 700; font-size: 1.05rem; white-space: nowrap; }
-.brand-mark { margin-right: 0.25rem; }
-.brand-app { font-weight: 500; color: var(--accent, #8a4b2f); }
+/* Organization switcher rendered as the top-left identity */
+#org-brand select {
+  font: inherit;
+  font-weight: 700;
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0 0.2rem 0 0;
+  cursor: pointer;
+}
 #topbar nav { display: flex; gap: 0.25rem; flex-wrap: wrap; }
 #topbar nav a {
   text-decoration: none;

@@ -43,7 +43,8 @@ class ApiError extends Error {
 // ---------------------------------------------------------------------------
 
 const state = {
-  me: null,          // { user, projects }
+  me: null,          // { user, projects, orgs }
+  activeOrgId: Number(localStorage.getItem('activeOrgId')) || null,
   activeProjectId: Number(localStorage.getItem('activeProjectId')) || null,
 };
 
@@ -99,8 +100,33 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
 }
 
-function activeProject() {
+// The active ORGANIZATION scopes the whole top bar: its name is the brand,
+// and the project switcher offers only its projects.
+function activeOrg() {
+  const orgs = state.me?.orgs ?? [];
+  return orgs.find((o) => o.id === state.activeOrgId) || orgs[0] || null;
+}
+
+/** Projects belonging to the active organization. */
+function orgProjects() {
   const projects = state.me?.projects ?? [];
+  const org = activeOrg();
+  return org ? projects.filter((p) => p.organization_id === org.id) : projects;
+}
+
+function setActiveOrg(id) {
+  state.activeOrgId = Number(id);
+  localStorage.setItem('activeOrgId', state.activeOrgId);
+  // Keep the active project inside the organization.
+  const inOrg = orgProjects();
+  if (!inOrg.some((p) => p.id === state.activeProjectId)) {
+    state.activeProjectId = inOrg[0]?.id ?? null;
+    localStorage.setItem('activeProjectId', state.activeProjectId ?? '');
+  }
+}
+
+function activeProject() {
+  const projects = orgProjects();
   return projects.find((p) => p.id === state.activeProjectId) || projects[0] || null;
 }
 
@@ -320,8 +346,29 @@ function renderTopbar() {
   // Translators browse the Dictionary and Phrases too (read-only; the server
   // blocks them from creating/editing entries).
 
+  // Top-left identity: the ORGANIZATION. One org shows its name; several
+  // become a switcher; none (a fresh platform admin) falls back to the brand.
+  const brandEl = $('#org-brand');
+  const orgs = state.me.orgs;
+  const org = activeOrg();
+  if (orgs.length > 1) {
+    brandEl.innerHTML = `<select id="org-switcher" title="Organization">
+      ${orgs.map((o) => `<option value="${o.id}">${esc(o.name)}</option>`).join('')}
+    </select>`;
+    $('#org-switcher').value = String(org.id);
+    $('#org-switcher').addEventListener('change', (e) => {
+      setActiveOrg(e.target.value);
+      listState.contributor = '';
+      listState.offset = 0;
+      renderTopbar();
+      route();
+    });
+  } else {
+    brandEl.textContent = org ? org.name : 'indigenous.ai';
+  }
+
   const sw = $('#project-switcher');
-  const projects = state.me.projects;
+  const projects = orgProjects();
   sw.innerHTML = projects.length
     ? projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
     : '<option value="">(no projects)</option>';
@@ -2054,7 +2101,10 @@ async function renderDashboard() {
   let data;
   try { data = await api('/projects'); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
-  const projects = data.projects;
+  // The dashboard is scoped to the active organization, like the top bar.
+  const projects = state.activeOrgId
+    ? data.projects.filter((p) => p.organization_id === activeOrg()?.id)
+    : data.projects;
 
   const totalEntries = projects.reduce((s, p) => s + p.entry_count, 0);
   const totalSeconds = projects.reduce((s, p) => s + p.audio_seconds, 0);
@@ -2333,7 +2383,11 @@ function showNewProjectModal() {
     try {
       await api('/projects', {
         method: 'POST',
-        body: { name: f.name.value, dialect: f.dialect.value, description: f.description.value },
+        body: {
+          name: f.name.value, dialect: f.dialect.value, description: f.description.value,
+          // create inside the organization the top bar is showing
+          ...(activeOrg() ? { organization_id: activeOrg().id } : {}),
+        },
       });
       closeModal();
       await loadMe();
@@ -2691,8 +2745,11 @@ async function renderOrganization() {
 
 async function loadMe() {
   state.me = await api('/me');
-  if (!state.me.projects.some((p) => p.id === state.activeProjectId)) {
-    state.activeProjectId = state.me.projects[0]?.id ?? null;
+  if (!state.me.orgs.some((o) => o.id === state.activeOrgId)) {
+    state.activeOrgId = state.me.orgs[0]?.id ?? null;
+  }
+  if (!orgProjects().some((p) => p.id === state.activeProjectId)) {
+    state.activeProjectId = orgProjects()[0]?.id ?? null;
   }
   renderTopbar();
 }

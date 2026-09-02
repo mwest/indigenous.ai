@@ -359,7 +359,23 @@ platform.put('/orgs/:id/apps/:code', requireSuperadmin, (req, res) => {
 });
 
 platform.get('/me', (req, res) => {
-  res.json({ user: req.user, projects: projectsFor(req.user), orgs: orgsFor(req.user) });
+  const projects = projectsFor(req.user);
+  // The org list is every organization the user can SEE — org memberships
+  // plus the owners of their projects (a translator with only a project
+  // membership still belongs, visually, to that project's organization;
+  // role null = no org-level authority).
+  const orgs = new Map(orgsFor(req.user).map((o) => [o.id, o]));
+  for (const p of projects) {
+    if (p.organization_id && !orgs.has(p.organization_id)) {
+      const o = db.prepare('SELECT id, name, slug FROM organizations WHERE id = ?').get(p.organization_id);
+      if (o) orgs.set(o.id, { ...o, role: null });
+    }
+  }
+  res.json({
+    user: req.user,
+    projects,
+    orgs: [...orgs.values()].sort((a, b) => a.name.localeCompare(b.name)),
+  });
 });
 
 platform.post('/me/password', (req, res) => {
