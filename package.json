@@ -1,7 +1,7 @@
 {
-  "name": "dene-translation-db",
+  "name": "indigenous-ai",
   "version": "1.0.0",
-  "description": "Dene-English Translation Database for the Dene Voice Project (dene.ca)",
+  "description": "Indigenous.ai — a platform for Indigenous governments. Language is the first application.",
   "type": "module",
   "main": "server.js",
   "scripts": {

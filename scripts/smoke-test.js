@@ -10,11 +10,24 @@ function check(name, cond, detail = '') {
   if (!cond) failures++;
 }
 
+// Test paths are written as '/api/<route>'; the server splits routes across
+// the Indigenous.ai platform API and the Language application API. Same rules
+// as the SPA's helper (consent-profiles are Language despite the /orgs prefix).
+const PLATFORM_API =
+  /^\/(login$|logout$|password\/|me$|me\/(password|name)$|orgs$|orgs\/|users$|users\/)/;
+function apiPath(path) {
+  if (!path.startsWith('/api/')) return path;
+  const rest = path.slice(4);
+  const prefix =
+    !rest.includes('/consent-profiles') && PLATFORM_API.test(rest) ? '/api/platform' : '/api/language';
+  return prefix + rest;
+}
+
 function client() {
   let cookie = '';
   return {
     async req(method, path, body, isForm = false) {
-      const res = await fetch(BASE + path, {
+      const res = await fetch(BASE + apiPath(path), {
         method,
         headers: {
           ...(cookie ? { Cookie: cookie } : {}),
@@ -33,7 +46,7 @@ function client() {
     },
     // Binary GET — for the export ZIP, where text decoding would corrupt bytes/length.
     async raw(method, path) {
-      const res = await fetch(BASE + path, { method, headers: cookie ? { Cookie: cookie } : {} });
+      const res = await fetch(BASE + apiPath(path), { method, headers: cookie ? { Cookie: cookie } : {} });
       return { status: res.status, headers: res.headers, buf: Buffer.from(await res.arrayBuffer()) };
     },
   };
@@ -1382,7 +1395,7 @@ check('consent profile deleted (cleanup)', r.status === 200);
 if (BASE.includes('localhost')) {
   try {
     const { default: db } = await import('../src/db.js');
-    const res = await fetch(BASE + '/api/login', {
+    const res = await fetch(BASE + '/api/platform/login', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: SA_EMAIL, password: SA_PASS }),
     });
@@ -1394,11 +1407,11 @@ if (BASE.includes('localhost')) {
     const hashed = cryptoMod.createHash('sha256').update(rawToken).digest('hex');
     check('hashed token IS stored and resolves the session',
       !!db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(hashed));
-    const me = await fetch(BASE + '/api/me', { headers: { Cookie: `dene_session=${rawToken}` } });
+    const me = await fetch(BASE + '/api/platform/me', { headers: { Cookie: `dene_session=${rawToken}` } });
     check('cookie with the raw token authenticates via hashed lookup', me.status === 200);
-    const bogus = await fetch(BASE + '/api/me', { headers: { Cookie: `dene_session=${'0'.repeat(64)}` } });
+    const bogus = await fetch(BASE + '/api/platform/me', { headers: { Cookie: `dene_session=${'0'.repeat(64)}` } });
     check('a random token fails', bogus.status === 401);
-    await fetch(BASE + '/api/logout', { method: 'POST', headers: { Cookie: `dene_session=${rawToken}` } });
+    await fetch(BASE + '/api/platform/logout', { method: 'POST', headers: { Cookie: `dene_session=${rawToken}` } });
     check('logout deletes the hashed session row',
       !db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(hashed));
   } catch (e) {
@@ -1420,6 +1433,40 @@ if (BASE.includes('localhost')) {
   check('other sessions are terminated by the password change', (await s2.req('GET', '/api/me')).status === 401);
   r = await s2.req('POST', '/api/login', { email: pwEmail, password: 'pwsess-pass-2' });
   check('other device signs back in with the NEW password', r.status === 200);
+}
+
+// --- Indigenous.ai application entitlement (organization_apps) ---
+{
+  const entEmail = `ent-${Date.now()}@test.ca`;
+  r = await sa.req('POST', '/api/users', { email: entEmail, name: 'Ent User', password: 'ent-pass-1234' });
+  check('entitlement test user created', r.status === 201 || r.status === 200, JSON.stringify(r.data));
+  const entOrgName = `Ent Org ${Date.now()}`;
+  r = await sa.req('POST', '/api/orgs', { name: entOrgName });
+  check('entitlement test org created (language auto-enabled)', r.status === 201, JSON.stringify(r.data));
+  const entOrgId = r.data.id;
+  r = await sa.req('POST', `/api/orgs/${entOrgId}/members`, { email: entEmail, role: 'member' });
+  const entUserId = r.data.user_id;
+  const ent = client();
+  await ent.req('POST', '/api/login', { email: entEmail, password: 'ent-pass-1234' });
+  r = await ent.req('GET', '/api/projects');
+  check('language routes work while the app is enabled', r.status === 200, r.status);
+  r = await sa.req('PUT', `/api/orgs/${entOrgId}/apps/language`, { status: 'disabled' });
+  check('superadmin can disable an app for an org', r.status === 200 && r.data.status === 'disabled', JSON.stringify(r.data));
+  r = await ent.req('GET', '/api/projects');
+  check('language routes 403 once the org has the app disabled', r.status === 403, r.status);
+  r = await ent.req('GET', '/api/me');
+  check('platform routes still work with the app disabled', r.status === 200, r.status);
+  r = await sa.req('GET', '/api/projects');
+  check('superadmin passes the entitlement gate (platform operation)', r.status === 200, r.status);
+  r = await sa.req('PUT', `/api/orgs/${entOrgId}/apps/language`, { status: 'enabled' });
+  check('re-enabling the app restores access', r.status === 200 && r.data.status === 'enabled');
+  r = await ent.req('GET', '/api/projects');
+  check('language routes work again after re-enable', r.status === 200, r.status);
+  // cleanup: org (sa is its owner_admin), then the user
+  r = await sa.req('DELETE', `/api/orgs/${entOrgId}`);
+  check('entitlement test org deleted (cleanup)', r.status === 200, JSON.stringify(r.data));
+  r = await sa.req('DELETE', `/api/users/${entUserId}`);
+  check('entitlement test user deleted (cleanup)', r.status === 200, JSON.stringify(r.data));
 }
 
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');

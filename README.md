@@ -1,11 +1,34 @@
-# Dene Voice Library
+# Indigenous.ai
 
-Members-only database of Dene–English translation pairs with audio recordings, built for the
-Dene Voice Project (dene.ca). Implements the PRD in `dene-translation-db-prd.md`:
-projects (dialects/communities), role-based access, translation entries with full Unicode
-Dene orthography support, audio attachments with automatic duration tracking, search and
-filtering, per-project dashboards with progress toward the 10 hr/dialect goal, and
-CSV/JSON export for STT/TTS training pipelines.
+**Indigenous.ai is the platform — a product for Indigenous governments. Language is its
+first application.** This repository is the Indigenous.ai platform codebase: one modular
+monolith serving the product root at `https://indigenous.ai` and the Language application
+at `https://indigenous.ai/language`.
+
+The Language application is a members-only database of translation pairs with audio
+recordings (originally built for the Dene Voice Project; see
+`dene-translation-db-prd.md` for the original PRD): projects (dialects/communities),
+role-based access, translation entries with full Unicode orthography support, audio
+attachments with automatic duration tracking, search and filtering, per-project
+dashboards, and CSV/JSON export for STT/TTS training pipelines.
+
+## Architecture: platform vs. application
+
+Module ownership for new code (a direction, not a mandate to move working code):
+
+- **Platform (Indigenous.ai)** — users, authentication/sessions, organizations,
+  organization memberships, application entitlements (`organization_apps`), payments
+  primitives. API under `/api/platform/...` (the `platform` router in `src/api.js`).
+- **Language application** — projects, entries, recordings, consent, work items,
+  compensation views, search, exports, public translation-request intake. API under
+  `/api/language/...` (the `language` router in `src/api.js`). Routes are gated by the
+  org-level `language` app entitlement.
+
+Organization identity is platform-wide; operational permissions are application-scoped.
+Do not treat a Language role (e.g. `translator`) as a platform role, and do not
+generalize Language domain concepts (speakers, corpora, orthographies) into platform
+concepts until a second real application proves the abstraction. `app.dene.ca` is a
+redirect only — it is not part of the architecture.
 
 ## Stack
 
@@ -162,31 +185,37 @@ Back up by copying the `data/` directory.
 
 ## API
 
-JSON API under `/api` with cookie sessions. Highlights:
+JSON API with cookie sessions, split by module. Highlights:
 
-- `POST /api/login`, `POST /api/logout`, `GET /api/me`
-- `GET/POST /api/projects`, `GET /api/projects/:id/stats`, `GET /api/projects/:id/export?format=csv|json`
-- `GET/POST /api/projects/:id/members`, `DELETE /api/projects/:id/members/:userId`
-- `GET/POST /api/entries` (filters: `q`, `project_id`, `has_audio`, `contributor`, `status`),
-  `GET/PATCH/DELETE /api/entries/:id`
-- `POST /api/entries/:id/audio` (multipart; fields: `file`, `language` (`dene`|`english`),
-  `speaker`, `recording_notes`), `GET /api/audio/:id/stream`,
-  `POST /api/audio/:id/replace`, `PATCH/DELETE /api/audio/:id`
-- Public (no session): `POST /api/requests/start` (emails a form link),
-  `GET/POST /api/requests/form/:token` (the form; POST is multipart with up to 5 `files`)
-- Superadmin: `GET /api/requests`, `GET/DELETE /api/requests/:id`,
-  `GET /api/requests/files/:id/download`
+Platform (`/api/platform`):
+- `POST /login`, `POST /logout`, `GET /me`, `POST /me/password`, `POST /me/name`
+- `GET/POST /orgs`, `GET/POST /orgs/:id/members`, `PUT /orgs/:id/apps/:code` (superadmin:
+  enable/disable an application for an organization)
+- Superadmin user management: `GET/POST /users`, `PATCH/DELETE /users/:id`
+
+Language (`/api/language`, gated by the org's `language` entitlement):
+- `GET/POST /projects`, `GET /projects/:id/stats`, `GET /projects/:id/export?format=csv|json`
+- `GET/POST /projects/:id/members`, `DELETE /projects/:id/members/:userId`
+- `GET/POST /entries` (filters: `q`, `project_id`, `has_audio`, `contributor`, `status`),
+  `GET/PATCH/DELETE /entries/:id`
+- `POST /entries/:id/audio` (multipart; fields: `file`, `language` (`dene`|`english`),
+  `speaker`, `recording_notes`), `GET /audio/:id/stream`, `PATCH/DELETE /audio/:id`
+- Public (no session): `POST /requests/start` (emails a form link),
+  `GET/POST /requests/form/:token` (the form; POST is multipart with up to 5 `files`)
+- Superadmin: `GET /requests`, `GET/DELETE /requests/:id`, `GET /requests/files/:id/download`
 
 Audio uploads accept WAV, MP3, and M4A up to 500 MB; corrupt or unreadable files are
 rejected with a clear message and the entry is left unchanged.
 
 ## Deployment (Fly.io, Toronto)
 
-The app runs at https://app.dene.ca on Fly.io in the `yyz` (Toronto) region — data
+The app runs at https://indigenous.ai on Fly.io in the `yyz` (Toronto) region — data
 stays in Canada. Config is in `fly.toml`; the SQLite DB and all audio live on a 10 GB
 encrypted volume (`dene_data`) mounted at `/app/data`, with automatic daily snapshots
-(5-day retention). DNS: `app.dene.ca` is a CNAME to `dene-translation-db.fly.dev`
-in Route 53.
+(5-day retention). The Fly app keeps its historical internal name
+(`dene-translation-db` — Fly apps can't be renamed); the product origin is set by DNS +
+certs. `app.dene.ca` remains only as a 301 redirect to `https://indigenous.ai/language`
+(hosts listed in `LEGACY_HOSTS`); set `APP_URL` to change the primary origin.
 
 Common operations (flyctl):
 
@@ -195,7 +224,7 @@ fly deploy --remote-only --ha=false   # ship the current working tree
 fly logs                              # tail production logs
 fly status                            # machine state
 fly ssh console                       # shell on the production machine
-fly certs check app.dene.ca           # TLS certificate status
+fly certs check indigenous.ai         # TLS certificate status (also: app.dene.ca redirect cert)
 fly ssh console -C "node scripts/create-superadmin.js <email> <name> <password>"
 ```
 
@@ -209,8 +238,8 @@ fly ssh sftp get /app/data/dene.db ./backup/dene.db
 ## Production notes
 
 - Run behind HTTPS (the session cookie is marked `Secure` when `NODE_ENV=production`).
-- The `projects.is_public` column exists for the future public Dene Voice Library face
-  (P2-1) but nothing reads it yet.
+- The `projects.is_public` column exists for a future public corpus face but nothing
+  reads it yet.
 
 ## Platform administration vs. data ownership
 

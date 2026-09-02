@@ -1,12 +1,22 @@
-/* Dene Voice Library — single-page app (no build step) */
+/* Indigenous.ai — Language: single-page app (no build step) */
 'use strict';
 
 // ---------------------------------------------------------------------------
 // API helper
 // ---------------------------------------------------------------------------
 
+// Identity/tenancy routes live on the Indigenous.ai platform API; everything
+// else is the Language application API. (/me/compensation is Language, and so
+// are the org-scoped consent-profile routes — consent is a Language concern.)
+const PLATFORM_API =
+  /^\/(login$|logout$|password\/|me$|me\/(password|name)$|orgs$|orgs\/|users$|users\/)/;
+const apiUrl = (path) =>
+  (path.includes('/consent-profiles') || PLATFORM_API.test(path) === false
+    ? '/api/language'
+    : '/api/platform') + path;
+
 async function api(path, opts = {}) {
-  const res = await fetch('/api' + path, {
+  const res = await fetch(apiUrl(path), {
     headers: opts.body instanceof FormData ? {} : { 'Content-Type': 'application/json' },
     ...opts,
     body: opts.body instanceof FormData ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
@@ -418,7 +428,7 @@ function renderLogin() {
   setActiveNav('');
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="brand-big">🪶 Indigenous.ai — Language</div>
       <div class="card">
         <form id="login-form">
           <label class="field"><span>Email</span>
@@ -432,8 +442,8 @@ function renderLogin() {
         </form>
       </div>
       <p class="login-note">Accounts are created by your project admin.<br>
-      Looking for a Dene translation? <a href="#/request">Submit a request</a>.<br>
-      Dene Voice Project · dene.ca</p>
+      Looking for a translation? <a href="#/request">Submit a request</a>.<br>
+      Indigenous.ai</p>
     </div>`;
   $('#login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -455,7 +465,7 @@ function renderForgot() {
   renderTopbar();
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="brand-big">🪶 Indigenous.ai — Language</div>
       <div class="card">
         <form id="forgot-form">
           <p>Enter your account email and we’ll send you a link to reset your password.</p>
@@ -483,7 +493,7 @@ function renderSetPassword(token) {
   renderTopbar();
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="brand-big">🪶 Indigenous.ai — Language</div>
       <div class="card" id="setpw-card"><p>Checking your link…</p></div>
     </div>`;
   (async () => {
@@ -528,7 +538,7 @@ function renderRequestStart() {
   renderTopbar();
   view.innerHTML = `
     <div class="login-wrap">
-      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="brand-big">🪶 Indigenous.ai — Language</div>
       <div class="card">
         <form id="request-start-form">
           <p>Looking for a Dene translation? Enter your email and we’ll send you a
@@ -560,7 +570,7 @@ function renderRequestForm(token) {
   renderTopbar();
   view.innerHTML = `
     <div class="request-wrap">
-      <div class="brand-big">🪶 Dene Voice Library</div>
+      <div class="brand-big">🪶 Indigenous.ai — Language</div>
       <div class="card" id="request-card"><p>Checking your link…</p></div>
     </div>`;
   (async () => {
@@ -700,10 +710,10 @@ async function renderJobDetail(id) {
             <span class="fname">${esc(f.original_name)}</span>
             <span style="color:var(--muted);font-size:0.85rem">
               ${fmtBytes(f.size_bytes)} ·
-              <a href="/api/requests/files/${f.id}/download?dl=1">Download</a></span>
+              <a href="/api/language/requests/files/${f.id}/download?dl=1">Download</a></span>
           </div>
           ${f.mime_type.startsWith('audio/')
-            ? `<audio controls preload="none" src="/api/requests/files/${f.id}/download"></audio>` : ''}
+            ? `<audio controls preload="none" src="/api/language/requests/files/${f.id}/download"></audio>` : ''}
         </div>`).join('') : '<p style="color:var(--muted)">No files attached.</p>'}
     </div>
     <div class="form-actions">
@@ -958,9 +968,9 @@ async function renderEntries(kind = 'word') {
       <h1>${isPhrase ? 'Phrases' : 'Dictionary'}</h1>
       <div class="head-actions">
         ${isAdminOf(ap.id) ? `
-          <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=csv&kind=${kind}">Export CSV</a>
-          <a class="btn secondary small" href="/api/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>
-          <a class="btn secondary small" href="/api/projects/${ap.id}/export-bundle?kind=${kind}" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
+          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export?format=csv&kind=${kind}">Export CSV</a>
+          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>
+          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export-bundle?kind=${kind}" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
         ${isTranslator() ? '' : `<a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>`}
       </div>
     </div>
@@ -1339,7 +1349,7 @@ async function renderEntryDetail(id) {
             versions.map((v) => `
               <div class="version-row">
                 <span>${fmtDuration(v.duration_seconds)} · ${(v.size_bytes / 1024 / 1024).toFixed(1)} MB · ${{ legacy_lossy: 'legacy', lossy_source: 'lossy source' }[v.archive_class] ?? 'master'}${v.sample_rate_hz ? ` · ${(v.sample_rate_hz / 1000).toFixed(1)} kHz` : ''} · ${fmtDate(v.created_at)}</span>
-                <a class="btn ghost small" href="/api/audio/${v.id}/master">⬇ Master</a>
+                <a class="btn ghost small" href="/api/language/audio/${v.id}/master">⬇ Master</a>
               </div>`).join('')
           : '<div class="empty small">No previous versions — this is the first recording.</div>';
       } catch (err) { box.innerHTML = `<div class="empty small">${esc(err.message)}</div>`; }
@@ -1381,12 +1391,12 @@ function slotHtml(lang, a) {
     <div class="audio-slot" data-lang="${lang}">
       <div class="slot-head">${label}</div>
       ${a ? `
-        <audio controls preload="none" src="/api/audio/${a.id}/stream"></audio>
+        <audio controls preload="none" src="/api/language/audio/${a.id}/stream"></audio>
         <div class="slot-meta">${fmtDuration(a.duration_seconds)} · ${fmtDate(a.created_at)}</div>
         <div class="slot-controls">
           <button type="button" class="rec-btn small" data-lang="${lang}">⏺ Re-record</button>
           <button type="button" class="danger small" data-action="delete" data-id="${a.id}">Delete</button>
-          <a class="btn ghost small" href="/api/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
+          <a class="btn ghost small" href="/api/language/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
           <button type="button" class="ghost small" data-slot-history="${a.id}">Versions</button>
         </div>
         <div class="audio-versions" id="slotver-${a.id}" hidden></div>` : `
@@ -1422,7 +1432,7 @@ function setupRecorder(entry) {
             versions.map((v) => `
               <div class="version-row">
                 <span>${fmtDuration(v.duration_seconds)} · ${(v.size_bytes / 1024 / 1024).toFixed(1)} MB${v.sample_rate_hz ? ` · ${(v.sample_rate_hz / 1000).toFixed(1)} kHz` : ''} · ${fmtDate(v.created_at)}</span>
-                <a class="btn ghost small" href="/api/audio/${v.id}/master">⬇ Master</a>
+                <a class="btn ghost small" href="/api/language/audio/${v.id}/master">⬇ Master</a>
               </div>`).join('')
           : '<div class="empty small">No previous versions — this is the first recording.</div>';
       } catch (err) { box2.innerHTML = `<div class="empty small">${esc(err.message)}</div>`; }
@@ -1521,10 +1531,10 @@ function audioItemHtml(a, entry) {
           ${a.speaker ? `Speaker: <b>${esc(a.speaker)}</b>` : ''}
           ${a.speaker && a.recording_notes ? ' · ' : ''}${esc(a.recording_notes ?? '')}
         </div>` : ''}
-      <audio controls preload="none" src="/api/audio/${a.id}/stream"></audio>
+      <audio controls preload="none" src="/api/language/audio/${a.id}/stream"></audio>
       ${canManage ? `
       <div class="audio-actions">
-        <a class="btn ghost small" href="/api/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
+        <a class="btn ghost small" href="/api/language/audio/${a.id}/master" title="Download the lossless archival master">⬇ Master</a>
         <button type="button" class="ghost small" data-action="history" data-id="${a.id}">Previous versions</button>
         <button type="button" class="ghost small" data-action="edit-meta" data-id="${a.id}">Edit details</button>
         ${isOrgAdmin() && !a.revoked_at ? `<button type="button" class="danger small" data-action="revoke" data-id="${a.id}">Revoke consent</button>` : ''}
@@ -2187,9 +2197,9 @@ function projectCardHtml(p) {
         <button class="ghost small" data-proj-action="activity" data-id="${p.id}">Recent activity</button>
         ${admin ? `
           <button class="ghost small" data-proj-action="members" data-id="${p.id}">Members</button>
-          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=csv">Export CSV</a>
-          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export?format=json">Export JSON</a>
-          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/projects/${p.id}/export-bundle" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
+          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/language/projects/${p.id}/export?format=csv">Export CSV</a>
+          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/language/projects/${p.id}/export?format=json">Export JSON</a>
+          <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/language/projects/${p.id}/export-bundle" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
         ${isOrgAdmin() ? `
           <button class="ghost small" data-proj-action="edit" data-id="${p.id}">Edit</button>
           <button class="ghost small" data-proj-action="import" data-id="${p.id}" data-name="${esc(p.name)}">Import CSV</button>

@@ -1,4 +1,6 @@
-# Fly.io configuration — Dene Voice Library
+# Fly.io configuration — Indigenous.ai
+# (Fly apps cannot be renamed; "dene-translation-db" is the historical internal
+# app name only. The product origin is https://indigenous.ai via certs/DNS.)
 app = "dene-translation-db"
 primary_region = "yyz"   # Toronto: keeps data in Canada
 

@@ -23,8 +23,15 @@ import {
   verifyPassword,
 } from './auth.js';
 
-const api = express.Router();
-api.use(express.json());
+// Two routers, one module. `platform` carries Indigenous.ai platform concerns
+// (identity, tenancy, org administration); `language` carries the Language
+// application (corpus, recordings, work, compensation, public intake). They
+// share this file's helpers deliberately — the physical src/platform vs
+// src/apps/language split happens only as code is naturally refactored.
+const platform = express.Router();
+const language = express.Router();
+platform.use(express.json());
+language.use(express.json());
 
 // archiver is CommonJS (classic factory API); pkg version goes in the export manifest.
 const cjsRequire = createRequire(import.meta.url);
@@ -49,7 +56,7 @@ function rateLimited(key, max, windowMs) {
 // Auth
 // ---------------------------------------------------------------------------
 
-api.post('/login', (req, res) => {
+platform.post('/login', (req, res) => {
   const { email, password } = req.body ?? {};
   if (!email || !password) return bad(res, 'Email and password are required');
   // The per-EMAIL cap is the real brute-force defense: it bounds guesses against
@@ -70,7 +77,7 @@ api.post('/login', (req, res) => {
   res.json({ ok: true });
 });
 
-api.post('/logout', (req, res) => {
+platform.post('/logout', (req, res) => {
   if (req.cookies[COOKIE_NAME]) destroySession(req.cookies[COOKIE_NAME]);
   res.clearCookie(COOKIE_NAME);
   res.json({ ok: true });
@@ -103,7 +110,7 @@ function lookupPasswordToken(token) {
     .get(hashToken(token));
 }
 
-const setPasswordLink = (token) => `${APP_URL}/#/set-password/${token}`;
+const setPasswordLink = (token) => `${APP_URL}/language#/set-password/${token}`;
 
 /** Generate an invite token + send the email. Returns {invite_sent, invite_link}. */
 async function sendInvite(user, invitedBy, projectName) {
@@ -113,7 +120,7 @@ async function sendInvite(user, invitedBy, projectName) {
 }
 
 // Request a reset link. Always answers ok so addresses can't be probed.
-api.post('/password/forgot', async (req, res) => {
+platform.post('/password/forgot', async (req, res) => {
   const email = String(req.body?.email ?? '').trim();
   if (!email) return bad(res, 'Email is required');
   // The per-EMAIL cap prevents reset-email bombing of a known address (and the
@@ -134,14 +141,14 @@ api.post('/password/forgot', async (req, res) => {
 });
 
 // Token preview so the set-password page can greet the user.
-api.get('/password/token/:token', (req, res) => {
+platform.get('/password/token/:token', (req, res) => {
   const t = lookupPasswordToken(req.params.token);
   if (!t) return bad(res, 'This link is invalid or has expired', 404);
   res.json({ valid: true, name: t.name, email: t.email, purpose: t.purpose });
 });
 
 // Set a new password using a valid token (single use, signs out everywhere).
-api.post('/password/reset', (req, res) => {
+platform.post('/password/reset', (req, res) => {
   const { token, password } = req.body ?? {};
   const t = token && lookupPasswordToken(token);
   if (!t) return bad(res, 'This link is invalid or has expired', 404);
@@ -166,7 +173,7 @@ const pruneExpiredRequests = () =>
   ).run();
 
 // Step 1: requester enters their email and gets a unique form link.
-api.post('/requests/start', async (req, res) => {
+language.post('/requests/start', async (req, res) => {
   const email = String(req.body?.email ?? '').trim();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return bad(res, 'A valid email is required');
   if (rateLimited(`req-ip:${req.ip}`, 30, 60 * 60 * 1000) ||
@@ -191,7 +198,7 @@ api.post('/requests/start', async (req, res) => {
        VALUES (?, ?, datetime('now', '+${REQUEST_LINK_HOURS} hours'))`
     ).run(hashToken(token), email);
   }
-  const link = `${APP_URL}/#/request/${token}`;
+  const link = `${APP_URL}/language#/request/${token}`;
   const { sent } = await sendMail({ to: email, ...requestFormEmail({ link }) });
   const out = { ok: true, sent };
   if (process.env.NODE_ENV !== 'production') out.form_link = link; // dev/test convenience
@@ -214,7 +221,7 @@ function loadRequestByToken(req, res, next) {
 }
 
 // Step 2a: the form page loads its state (email is fixed server-side).
-api.get('/requests/form/:token', loadRequestByToken, (req, res) => {
+language.get('/requests/form/:token', loadRequestByToken, (req, res) => {
   const { email, name, dialect, details, status } = req.request;
   res.json({ email, name, dialect, details, status });
 });
@@ -248,7 +255,7 @@ const requestUpload = multer({
 });
 
 // Step 2b: submit the form (multipart, up to 5 files), then notify superadmins.
-api.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
+language.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
   if (req.request.status === 'submitted') {
     return bad(res, 'This request has already been submitted');
   }
@@ -290,7 +297,7 @@ api.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
   const mail = requestNotifyEmail({
     name, email: req.request.email, dialect, details,
     fileCount: (req.files ?? []).length,
-    link: `${APP_URL}/#/jobs/${req.request.id}`,
+    link: `${APP_URL}/language#/jobs/${req.request.id}`,
   });
   for (const admin of db.prepare('SELECT email FROM users WHERE is_superadmin = 1').all()) {
     await sendMail({ to: admin.email, ...mail });
@@ -298,13 +305,61 @@ api.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
   res.json({ ok: true });
 });
 
-api.use(requireAuth); // everything below requires a session
+// Everything below requires a session, on both routers. (Registration order in
+// this file is per-router: public routes above stay public.)
+platform.use(requireAuth);
+language.use(requireAuth);
 
-api.get('/me', (req, res) => {
+// Indigenous.ai application entitlement: an organization must have the
+// 'language' app enabled for its people to use Language routes. Superadmins
+// pass (platform operation — corpus access is still governed by org/project
+// roles); users with no org ties yet pass too (there is nothing to gate, and
+// the routes themselves return empty lists / 403s).
+language.use((req, res, next) => {
+  if (req.user.is_superadmin) return next();
+  const orgIds = db
+    .prepare(
+      `SELECT organization_id AS id FROM organization_memberships WHERE user_id = ?
+       UNION
+       SELECT p.organization_id AS id FROM memberships m
+        JOIN projects p ON p.id = m.project_id
+       WHERE m.user_id = ? AND p.organization_id IS NOT NULL`
+    )
+    .all(req.user.id, req.user.id)
+    .map((r) => r.id);
+  if (!orgIds.length) return next();
+  const enabled = db
+    .prepare(
+      `SELECT 1 FROM organization_apps
+       WHERE app_code = 'language' AND status = 'enabled'
+         AND organization_id IN (${orgIds.map(() => '?').join(',')})`
+    )
+    .get(...orgIds);
+  if (!enabled) return bad(res, 'The Language application is not enabled for your organization', 403);
+  next();
+});
+
+// Platform administration: enable/disable an application for an organization.
+platform.put('/orgs/:id/apps/:code', requireSuperadmin, (req, res) => {
+  const org = db.prepare('SELECT id FROM organizations WHERE id = ?').get(Number(req.params.id));
+  if (!org) return bad(res, 'Organization not found', 404);
+  const code = String(req.params.code);
+  const status = req.body?.status === 'disabled' ? 'disabled' : 'enabled';
+  db.prepare(
+    `INSERT INTO organization_apps (organization_id, app_code, status, disabled_at)
+     VALUES (@org, @code, @status, CASE WHEN @status = 'disabled' THEN datetime('now') END)
+     ON CONFLICT(organization_id, app_code) DO UPDATE SET
+       status = excluded.status,
+       disabled_at = CASE WHEN excluded.status = 'disabled' THEN datetime('now') END`
+  ).run({ org: org.id, code, status });
+  res.json({ ok: true, app_code: code, status });
+});
+
+platform.get('/me', (req, res) => {
   res.json({ user: req.user, projects: projectsFor(req.user), orgs: orgsFor(req.user) });
 });
 
-api.post('/me/password', (req, res) => {
+platform.post('/me/password', (req, res) => {
   const { current_password, new_password } = req.body ?? {};
   if (!current_password || !new_password) return bad(res, 'Both passwords are required');
   if (String(new_password).length < 8) return bad(res, 'New password must be at least 8 characters');
@@ -323,7 +378,7 @@ api.post('/me/password', (req, res) => {
 });
 
 // Change your own display name.
-api.post('/me/name', (req, res) => {
+platform.post('/me/name', (req, res) => {
   const name = String(req.body?.name ?? '').trim();
   if (!name) return bad(res, 'Name is required');
   db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.user.id);
@@ -354,13 +409,13 @@ function requireOrgAdminOfProject(req, res, next) {
 const adminOrgIdsFor = (user) =>
   orgsFor(user).filter((o) => o.role === 'owner_admin' || o.role === 'admin').map((o) => o.id);
 
-api.get('/orgs', (req, res) => {
+platform.get('/orgs', (req, res) => {
   res.json({ orgs: orgsFor(req.user) });
 });
 
 // Provisioning (platform): create an organization. The creator — or, if given,
 // an existing user named by owner_email — becomes its owner_admin.
-api.post('/orgs', requireSuperadmin, (req, res) => {
+platform.post('/orgs', requireSuperadmin, (req, res) => {
   const name = String(req.body?.name ?? '').trim();
   if (!name) return bad(res, 'Organization name is required');
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || null;
@@ -374,6 +429,9 @@ api.post('/orgs', requireSuperadmin, (req, res) => {
       const i = db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)').run(name, slug);
       db.prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
         .run(i.lastInsertRowid, owner.id, 'owner_admin');
+      // Language is currently the only application; new tenants start with it.
+      db.prepare(`INSERT INTO organization_apps (organization_id, app_code) VALUES (?, 'language')`)
+        .run(i.lastInsertRowid);
       return i;
     })();
     res.status(201).json(db.prepare('SELECT * FROM organizations WHERE id = ?').get(info.lastInsertRowid));
@@ -383,7 +441,7 @@ api.post('/orgs', requireSuperadmin, (req, res) => {
   }
 });
 
-api.patch('/orgs/:id', (req, res) => {
+platform.patch('/orgs/:id', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
@@ -393,7 +451,7 @@ api.patch('/orgs/:id', (req, res) => {
   res.json(db.prepare('SELECT * FROM organizations WHERE id = ?').get(org.id));
 });
 
-api.get('/orgs/:id/members', (req, res) => {
+platform.get('/orgs/:id/members', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
@@ -409,7 +467,7 @@ api.get('/orgs/:id/members', (req, res) => {
 
 // Add or change an org member (existing accounts only — account creation stays a
 // platform/user-management concern). Only owner_admins manage org roles.
-api.post('/orgs/:id/members', (req, res) => {
+platform.post('/orgs/:id/members', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
@@ -437,7 +495,7 @@ api.post('/orgs/:id/members', (req, res) => {
 // consent profiles cascade. Financial history (work_log/payments) must outlive
 // the org, so any rows attributed to it are detached to legacy (NULL org) —
 // they remain visible to the contributor via /me, invisible to admin views.
-api.delete('/orgs/:id', (req, res) => {
+platform.delete('/orgs/:id', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
@@ -452,7 +510,7 @@ api.delete('/orgs/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-api.delete('/orgs/:id/members/:userId', (req, res) => {
+platform.delete('/orgs/:id/members/:userId', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
@@ -482,14 +540,14 @@ const CONSENT_FLAGS = [
   'allow_redistribution',
 ];
 
-api.get('/orgs/:id/consent-profiles', (req, res) => {
+language.get('/orgs/:id/consent-profiles', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
   res.json({ profiles: db.prepare('SELECT * FROM consent_profiles WHERE organization_id = ? ORDER BY name').all(org.id) });
 });
 
-api.post('/orgs/:id/consent-profiles', (req, res) => {
+language.post('/orgs/:id/consent-profiles', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
@@ -517,7 +575,7 @@ function loadConsentProfile(req, res, next) {
   next();
 }
 
-api.patch('/consent-profiles/:id', loadConsentProfile, (req, res) => {
+language.patch('/consent-profiles/:id', loadConsentProfile, (req, res) => {
   const p = req.consentProfile;
   const name = req.body?.name !== undefined ? String(req.body.name).trim() : p.name;
   if (!name) return bad(res, 'Profile name is required');
@@ -530,7 +588,7 @@ api.patch('/consent-profiles/:id', loadConsentProfile, (req, res) => {
   res.json(db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(p.id));
 });
 
-api.delete('/consent-profiles/:id', loadConsentProfile, (req, res) => {
+language.delete('/consent-profiles/:id', loadConsentProfile, (req, res) => {
   // Snapshots on recordings reference the profile only by NAME, so they are
   // untouched; clear project defaults that point at it before deleting.
   db.transaction(() => {
@@ -542,7 +600,7 @@ api.delete('/consent-profiles/:id', loadConsentProfile, (req, res) => {
 });
 
 // Choose (or clear) the profile stamped onto NEW recordings in this project.
-api.put('/projects/:id/consent-default', requireOrgAdminOfProject, (req, res) => {
+language.put('/projects/:id/consent-default', requireOrgAdminOfProject, (req, res) => {
   const profileId = req.body?.profile_id ? Number(req.body.profile_id) : null;
   if (profileId) {
     const profile = db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(profileId);
@@ -557,7 +615,7 @@ api.put('/projects/:id/consent-default', requireOrgAdminOfProject, (req, res) =>
 // Bulk-assign a profile snapshot to this project's consent-UNKNOWN recordings
 // (already-assigned and revoked recordings are never touched). One audit row per
 // recording, all in one transaction.
-api.post('/projects/:id/consent/assign', requireOrgAdminOfProject, (req, res) => {
+language.post('/projects/:id/consent/assign', requireOrgAdminOfProject, (req, res) => {
   const profile = db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(Number(req.body?.profile_id));
   if (!profile || profile.organization_id !== req.project.organization_id) {
     return bad(res, 'A consent profile from the project’s organization is required');
@@ -615,7 +673,7 @@ const projectStats = db.prepare(`
       JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ? AND a.is_current = 1) AS audio_seconds
 `);
 
-api.get('/projects', (req, res) => {
+language.get('/projects', (req, res) => {
   const projects = projectsFor(req.user).map((p) => ({
     ...p,
     ...projectStats.get(p.id, p.id, p.id),
@@ -625,7 +683,7 @@ api.get('/projects', (req, res) => {
 
 // Create a project inside an organization the caller administers. With one org
 // (the common case) organization_id can be omitted and defaults to it.
-api.post('/projects', (req, res) => {
+language.post('/projects', (req, res) => {
   const { name, dialect, description } = req.body ?? {};
   if (!name || !String(name).trim()) return bad(res, 'Project name is required');
   const adminOrgs = adminOrgIdsFor(req.user);
@@ -650,7 +708,7 @@ api.post('/projects', (req, res) => {
   }
 });
 
-api.patch('/projects/:id', requireOrgAdminOfProject, (req, res) => {
+language.patch('/projects/:id', requireOrgAdminOfProject, (req, res) => {
   const project = req.project;
   const { name, dialect, description } = req.body ?? {};
   try {
@@ -669,7 +727,7 @@ api.patch('/projects/:id', requireOrgAdminOfProject, (req, res) => {
 
 // Permanently delete a project with all entries, recordings, and memberships.
 // Requires the exact project name as confirmation.
-api.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
+language.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
   const project = req.project;
   const { confirm_name } = req.body ?? {};
   if (confirm_name !== project.name) {
@@ -707,7 +765,7 @@ function requireProjectAdmin(req, res, next) {
 // Membership management
 // ---------------------------------------------------------------------------
 
-api.get('/projects/:id/members', requireProjectAdmin, (req, res) => {
+language.get('/projects/:id/members', requireProjectAdmin, (req, res) => {
   const members = db
     .prepare(
       `SELECT u.id, u.email, u.name, m.role, m.created_at,
@@ -722,7 +780,7 @@ api.get('/projects/:id/members', requireProjectAdmin, (req, res) => {
 
 // Add a member: existing user by email, or create a new account. With no
 // password, the new account gets an invite email with a set-password link.
-api.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
+language.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
   const { email, name, password, role } = req.body ?? {};
   if (!email || !String(email).trim()) return bad(res, 'Email is required');
   const memberRole = ['admin', 'translator'].includes(role) ? role : 'member';
@@ -769,7 +827,7 @@ api.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
   res.status(201).json({ ok: true, user_id: user.id, ...(invite ?? {}) });
 });
 
-api.delete('/projects/:id/members/:userId', requireProjectAdmin, (req, res) => {
+language.delete('/projects/:id/members/:userId', requireProjectAdmin, (req, res) => {
   const membership = db
     .prepare('SELECT * FROM memberships WHERE user_id = ? AND project_id = ?')
     .get(req.params.userId, req.project.id);
@@ -790,7 +848,7 @@ api.delete('/projects/:id/members/:userId', requireProjectAdmin, (req, res) => {
 // User management (superadmin)
 // ---------------------------------------------------------------------------
 
-api.get('/users', requireSuperadmin, (req, res) => {
+platform.get('/users', requireSuperadmin, (req, res) => {
   const users = db
     .prepare(
       `SELECT u.id, u.email, u.name, u.is_superadmin, u.created_at,
@@ -811,7 +869,7 @@ api.get('/users', requireSuperadmin, (req, res) => {
 // Create an account without any project membership. If no password is given,
 // the account is created locked and an invite email with a set-password link
 // is sent instead.
-api.post('/users', requireSuperadmin, async (req, res) => {
+platform.post('/users', requireSuperadmin, async (req, res) => {
   const { email, name, password } = req.body ?? {};
   if (!email?.trim() || !name?.trim()) {
     return bad(res, 'Email and name are required');
@@ -836,7 +894,7 @@ api.post('/users', requireSuperadmin, async (req, res) => {
 });
 
 // Edit name, reset password, or grant/revoke superadmin.
-api.patch('/users/:id', requireSuperadmin, (req, res) => {
+platform.patch('/users/:id', requireSuperadmin, (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!user) return bad(res, 'User not found', 404);
   const { name, password, is_superadmin } = req.body ?? {};
@@ -860,7 +918,7 @@ api.patch('/users/:id', requireSuperadmin, (req, res) => {
   res.json({ ok: true });
 });
 
-api.delete('/users/:id', requireSuperadmin, (req, res) => {
+platform.delete('/users/:id', requireSuperadmin, (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
   if (!user) return bad(res, 'User not found', 404);
   if (user.id === req.user.id) return bad(res, 'You cannot delete your own account');
@@ -882,7 +940,7 @@ api.delete('/users/:id', requireSuperadmin, (req, res) => {
 // Translation jobs (superadmin) — review submitted public requests
 // ---------------------------------------------------------------------------
 
-api.get('/requests', requireSuperadmin, (req, res) => {
+language.get('/requests', requireSuperadmin, (req, res) => {
   pruneExpiredRequests();
   const requests = db
     .prepare(
@@ -896,7 +954,7 @@ api.get('/requests', requireSuperadmin, (req, res) => {
 });
 
 // More specific than /requests/:id below, so register it first.
-api.get('/requests/files/:id/download', requireSuperadmin, (req, res) => {
+language.get('/requests/files/:id/download', requireSuperadmin, (req, res) => {
   const f = db.prepare('SELECT * FROM request_files WHERE id = ?').get(req.params.id);
   if (!f) return bad(res, 'File not found', 404);
   // Uploaded content is untrusted: only audio may render inline (for the
@@ -912,7 +970,7 @@ api.get('/requests/files/:id/download', requireSuperadmin, (req, res) => {
   });
 });
 
-api.get('/requests/:id', requireSuperadmin, (req, res) => {
+language.get('/requests/:id', requireSuperadmin, (req, res) => {
   if (!/^\d+$/.test(req.params.id)) return bad(res, 'Not found', 404);
   const request = db.prepare('SELECT * FROM translation_requests WHERE id = ?').get(req.params.id);
   if (!request) return bad(res, 'Request not found', 404);
@@ -926,7 +984,7 @@ api.get('/requests/:id', requireSuperadmin, (req, res) => {
   res.json({ ...rest, files });
 });
 
-api.delete('/requests/:id', requireSuperadmin, (req, res) => {
+language.delete('/requests/:id', requireSuperadmin, (req, res) => {
   const request = db.prepare('SELECT * FROM translation_requests WHERE id = ?').get(req.params.id);
   if (!request) return bad(res, 'Request not found', 404);
   db.prepare('DELETE FROM translation_requests WHERE id = ?').run(request.id); // files cascade
@@ -938,7 +996,7 @@ api.delete('/requests/:id', requireSuperadmin, (req, res) => {
 // Dashboard / stats
 // ---------------------------------------------------------------------------
 
-api.get('/projects/:id/stats', (req, res) => {
+language.get('/projects/:id/stats', (req, res) => {
   const projectId = Number(req.params.id);
   if (!roleIn(req.user, projectId)) return bad(res, 'Not a member of this project', 403);
   const stats = projectStats.get(projectId, projectId, projectId);
@@ -987,7 +1045,7 @@ const entrySelect = `
 // Positional params consumed by entrySelect, in SQL text order.
 const entryParams = () => [];
 
-api.get('/entries', async (req, res) => {
+language.get('/entries', async (req, res) => {
   const visible = projectIdsFor(req.user);
   if (visible.length === 0) return res.json({ entries: [], total: 0 });
 
@@ -1167,7 +1225,7 @@ function applyTranslation(entry, nextDene, nextEnglish, userId) {
   if (nextEnglish !== entry.english_text) storeEmbedding(entry.id, nextEnglish);
 }
 
-api.post('/entries', (req, res) => {
+language.post('/entries', (req, res) => {
   const { project_id, dene_text, english_text, source_doc, notes, category } = req.body ?? {};
   const projectId = Number(project_id);
   const role = roleIn(req.user, projectId);
@@ -1198,7 +1256,7 @@ api.post('/entries', (req, res) => {
   res.status(201).json(entry);
 });
 
-api.get('/entries/:id', loadEntry, (req, res) => {
+language.get('/entries/:id', loadEntry, (req, res) => {
   // All project members see every recording.
   const audio = db
     .prepare(
@@ -1211,7 +1269,7 @@ api.get('/entries/:id', loadEntry, (req, res) => {
   res.json({ ...req.entry, audio, can_edit: canEditEntry(req), role: req.projectRole });
 });
 
-api.patch('/entries/:id', loadEntry, (req, res) => {
+language.patch('/entries/:id', loadEntry, (req, res) => {
   if (!canEditEntry(req)) return bad(res, 'You can only edit your own entries', 403);
   const { dene_text, english_text, source_doc, notes, category, status } = req.body ?? {};
   // Resolve the resulting two sides; every entry must keep at least one (an
@@ -1244,7 +1302,7 @@ api.patch('/entries/:id', loadEntry, (req, res) => {
   );
 });
 
-api.delete('/entries/:id', loadEntry, (req, res) => {
+language.delete('/entries/:id', loadEntry, (req, res) => {
   if (!canEditEntry(req)) return bad(res, 'You can only delete your own entries', 403);
   const files = db
     .prepare('SELECT stored_name, playback_stored_name FROM audio_files WHERE entry_id = ?')
@@ -1257,7 +1315,7 @@ api.delete('/entries/:id', loadEntry, (req, res) => {
 // Fill in an entry's missing side directly (members/admins; unbilled) — words
 // and phrases alike can be one-sided and queued for translation. Paid
 // translation flows through work items; translators use the translation session.
-api.post('/entries/:id/translate', loadEntry, rejectTranslators, (req, res) => {
+language.post('/entries/:id/translate', loadEntry, rejectTranslators, (req, res) => {
   const incomplete = req.entry.dene_text === '' || req.entry.english_text === '';
   if (!incomplete && !canEditEntry(req)) return bad(res, 'This entry is already complete', 403);
   const { dene_text, english_text } = req.body ?? {};
@@ -1394,7 +1452,7 @@ function saveMasterRecording({ entry, userId, file, probe, sha256 = null, langua
 // Record (or re-record) a master. Re-recording supersedes the prior version
 // rather than replacing it — old masters are never destroyed (#8b). Billed once,
 // on the first version for a (entry, user, language) slot.
-api.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, async (req, res) => {
+language.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, async (req, res) => {
   if (!req.file) return bad(res, 'No audio file provided');
   const filePath = req.file.path;
   // Can't record an incomplete phrase — it must be translated first.
@@ -1439,7 +1497,7 @@ function loadAudio(req, res, next) {
   next();
 }
 
-api.get('/audio/:id/stream', loadAudio, (req, res) => {
+language.get('/audio/:id/stream', loadAudio, (req, res) => {
   // Any member of the entry's project can listen (loadAudio enforces membership).
   // Serve the lightweight playback derivative when it exists; otherwise stream the
   // master directly (e.g. before the derivative is generated, or without ffmpeg).
@@ -1455,7 +1513,7 @@ api.get('/audio/:id/stream', loadAudio, (req, res) => {
 
 // Download the archival master (admins and the uploader). Always the lossless
 // original, as an attachment.
-api.get('/audio/:id/master', loadAudio, (req, res) => {
+language.get('/audio/:id/master', loadAudio, (req, res) => {
   if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
     return bad(res, 'Only the uploader or a project admin can download the master', 403);
   }
@@ -1469,7 +1527,7 @@ api.get('/audio/:id/master', loadAudio, (req, res) => {
 });
 
 // Superseded versions of this recording's slot, newest first (uploader/admin).
-api.get('/audio/:id/history', loadAudio, (req, res) => {
+language.get('/audio/:id/history', loadAudio, (req, res) => {
   if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
     return bad(res, 'Only the uploader or a project admin can view version history', 403);
   }
@@ -1489,7 +1547,7 @@ api.get('/audio/:id/history', loadAudio, (req, res) => {
 // asset stays in the archive (flagged) but is excluded from purpose-filtered
 // exports and any future public/AI-training surface. Physical deletion remains
 // a separate, explicit action under the owner's policy.
-api.post('/audio/:id/revoke', loadAudio, (req, res) => {
+language.post('/audio/:id/revoke', loadAudio, (req, res) => {
   const org = db
     .prepare('SELECT p.organization_id AS oid FROM entries e JOIN projects p ON p.id = e.project_id WHERE e.id = ?')
     .get(req.audio.entry_id);
@@ -1508,7 +1566,7 @@ api.post('/audio/:id/revoke', loadAudio, (req, res) => {
   res.json(db.prepare('SELECT * FROM audio_files WHERE id = ?').get(req.audio.id));
 });
 
-api.patch('/audio/:id', loadAudio, (req, res) => {
+language.patch('/audio/:id', loadAudio, (req, res) => {
   if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
     return bad(res, 'You can only edit audio you uploaded', 403);
   }
@@ -1521,7 +1579,7 @@ api.patch('/audio/:id', loadAudio, (req, res) => {
   res.json(db.prepare('SELECT * FROM audio_files WHERE id = ?').get(req.audio.id));
 });
 
-api.delete('/audio/:id', loadAudio, (req, res) => {
+language.delete('/audio/:id', loadAudio, (req, res) => {
   if (req.audioRole !== 'admin' && req.audio.uploaded_by !== req.user.id) {
     return bad(res, 'You can only delete audio you uploaded', 403);
   }
@@ -1634,7 +1692,7 @@ function submitResult(item) {
 // Claim a batch of work. Runs as ONE synchronous transaction (no awaits) so
 // concurrent claims cannot hand the same job to two people; the partial unique
 // indexes are a backstop for that invariant and the future admin-reassign flow.
-api.post('/projects/:id/work/claim', (req, res) => {
+language.post('/projects/:id/work/claim', (req, res) => {
   const projectId = Number(req.params.id);
   const role = roleIn(req.user, projectId);
   if (!role) return bad(res, 'Not a member of this project', 403);
@@ -1747,7 +1805,7 @@ api.post('/projects/:id/work/claim', (req, res) => {
 });
 
 // Submit a claimed work item; auto-accepts and bills in one transaction.
-api.post('/work/:id/submit', loadWorkItem, (req, res) => {
+language.post('/work/:id/submit', loadWorkItem, (req, res) => {
   const item = req.workItem;
   // Submitting is ASSIGNEE-only: acceptance bills item.assigned_to, so an admin
   // submitting on a contributor's behalf would credit the contributor for work
@@ -1845,7 +1903,7 @@ api.post('/work/:id/submit', loadWorkItem, (req, res) => {
 // Release a still-claimed item back to the queue (Skip / Exit a session).
 // Admin-authorized rework returns to 'queued' — skipping a rework take must not
 // destroy the authorization; ordinary claims are cancelled back to the pool.
-api.post('/work/:id/release', loadWorkItem, (req, res) => {
+language.post('/work/:id/release', loadWorkItem, (req, res) => {
   if (req.workItem.status === 'claimed') {
     if (req.workItem.rework_authorized) {
       db.prepare(
@@ -1863,7 +1921,7 @@ api.post('/work/:id/release', loadWorkItem, (req, res) => {
 // or superseding an accepted recording never re-opens billing by itself; an org
 // admin must explicitly create this rework item, which the speaker's next
 // recording-session claim adopts.
-api.post('/entries/:id/audio-rework', (req, res) => {
+language.post('/entries/:id/audio-rework', (req, res) => {
   const entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(req.params.id);
   if (!entry) return bad(res, 'Entry not found', 404);
   const org = db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(entry.project_id);
@@ -1903,7 +1961,7 @@ api.post('/entries/:id/audio-rework', (req, res) => {
 // Export (P1-2): CSV / JSON with audio file references
 // ---------------------------------------------------------------------------
 
-api.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
+language.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
   // Optional ?kind exports just the dictionary words or just the phrases;
   // without it, the file contains everything (the kind column distinguishes them).
   const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
@@ -1996,7 +2054,7 @@ const EXPORT_PURPOSES = {
   redistribution: 'allow_redistribution',
 };
 
-api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => {
+language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => {
   const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
   const kindSql = kind ? ' AND e.kind = ?' : '';
   const kindArg = kind ? [kind] : [];
@@ -2159,7 +2217,7 @@ api.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res) => 
   };
   const manifestStr = JSON.stringify(manifest, null, 2);
   const readme = [
-    `Dene Voice Library — corpus export`,
+    `Indigenous.ai Language — corpus export`,
     `Project: ${req.project.name}${req.project.dialect ? ` (${req.project.dialect})` : ''}`,
     `Exported: ${manifest.exported_at}  ·  app v${pkg.version}  ·  schema ${manifest.schema_version}`,
     ``,
@@ -2264,7 +2322,7 @@ const csvUpload = multer({
 
 const MAX_IMPORT_ROWS = 10000;
 
-api.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next) => {
+language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next) => {
   csvUpload.single('file')(req, res, (err) => {
     if (err) {
       return bad(res, err.code === 'LIMIT_FILE_SIZE' ? 'File is too large (max 10 MB)' : err.message);
@@ -2383,7 +2441,7 @@ const paymentsFor = db.prepare(
 );
 
 // Any signed-in user sees their own running total, work log, and payments.
-api.get('/me/compensation', (req, res) => {
+language.get('/me/compensation', (req, res) => {
   res.json({
     ...totalsFor(req.user.id),
     work: workLogFor.all(req.user.id),
@@ -2458,7 +2516,7 @@ function paymentsScoped(userId, orgIds) {
 
 // Everyone there is money to account for in the caller's orgs: current/past
 // translators and anyone with org-attributed ledger or payment history there.
-api.get('/compensation', requireAnyOrgAdmin, (req, res) => {
+language.get('/compensation', requireAnyOrgAdmin, (req, res) => {
   const ph = orgPh(req);
   const people = db
     .prepare(
@@ -2473,7 +2531,7 @@ api.get('/compensation', requireAnyOrgAdmin, (req, res) => {
   res.json({ translators: people.map((p) => ({ ...p, ...totalsScoped(p.id, req.adminOrgIds) })) });
 });
 
-api.get('/compensation/:userId', requireAnyOrgAdmin, (req, res) => {
+language.get('/compensation/:userId', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
@@ -2499,7 +2557,7 @@ api.get('/compensation/:userId', requireAnyOrgAdmin, (req, res) => {
 });
 
 // Set or change a per-project rate; logs an audit row.
-api.put('/compensation/:userId/rates', requireAnyOrgAdmin, (req, res) => {
+language.put('/compensation/:userId/rates', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   const projectId = Number(req.body?.project_id);
@@ -2545,7 +2603,7 @@ function resolveMoneyOrg(req, res) {
 
 // Record a payment already made offline (the app never moves money). Stamped
 // with the paying organization for tenant scoping.
-api.post('/compensation/:userId/payments', requireAnyOrgAdmin, (req, res) => {
+language.post('/compensation/:userId/payments', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
@@ -2563,7 +2621,7 @@ api.post('/compensation/:userId/payments', requireAnyOrgAdmin, (req, res) => {
 
 // Manual ledger adjustment (+/-): bonuses, corrections, pricing unrated work.
 // A project is required so the adjustment is org-attributable.
-api.post('/compensation/:userId/adjustments', requireAnyOrgAdmin, (req, res) => {
+language.post('/compensation/:userId/adjustments', requireAnyOrgAdmin, (req, res) => {
   const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.userId);
   if (!user) return bad(res, 'User not found', 404);
   if (!userInAdminOrgs(req, user.id)) return bad(res, 'Organization admin access required', 403);
@@ -2586,13 +2644,16 @@ api.post('/compensation/:userId/adjustments', requireAnyOrgAdmin, (req, res) => 
 
 // ---------------------------------------------------------------------------
 
-api.use((req, res) => bad(res, 'Not found', 404));
-
+const notFound = (req, res) => bad(res, 'Not found', 404);
 // JSON error handler so API errors never return HTML.
-api.use((err, req, res, next) => {
+const jsonError = (err, req, res, next) => {
   console.error(err);
   if (res.headersSent) return next(err);
   bad(res, 'Internal server error', 500);
-});
+};
+platform.use(notFound);
+platform.use(jsonError);
+language.use(notFound);
+language.use(jsonError);
 
-export default api;
+export { platform, language };
