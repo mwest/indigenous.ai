@@ -2428,7 +2428,7 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
   };
   const manifestStr = JSON.stringify(manifest, null, 2);
   const readme = [
-    `Indigenous.ai Language — corpus export`,
+    `indigenous.ai Language — corpus export`,
     `Project: ${req.project.name}${req.project.dialect ? ` (${req.project.dialect})` : ''}`,
     `Exported: ${manifest.exported_at}  ·  app v${pkg.version}  ·  schema ${manifest.schema_version}`,
     ``,
