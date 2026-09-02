@@ -1553,6 +1553,17 @@ if (BASE.includes('localhost')) {
   }
 }
 
+// --- root sign-in page ---
+{
+  const anon = client();
+  r = await anon.req('GET', '/');
+  check('signed-out root serves the sign-in page (no forward)',
+    r.status === 200 && String(r.data).includes('Sign in'), r.status);
+  r = await sa.req('GET', '/');
+  check('signed-in root forwards to /language',
+    r.status === 302 && (r.headers.get('location') || '').includes('/language'), r.status);
+}
+
 // --- corpus / campaign separation (plan §10) ---
 // Local-only (shared-corpus cleanup needs direct SQLite access).
 if (BASE.includes('localhost')) {
