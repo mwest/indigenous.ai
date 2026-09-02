@@ -429,7 +429,7 @@ platform.post('/orgs', requireSuperadmin, (req, res) => {
   }
   try {
     const info = db.transaction(() => {
-      const i = db.prepare('INSERT INTO organizations (name, slug) VALUES (?, ?)').run(name, slug);
+      const i = db.prepare('INSERT INTO organizations (uid, name, slug) VALUES (?, ?, ?)').run(uuidv7(), name, slug);
       db.prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
         .run(i.lastInsertRowid, owner.id, 'owner_admin');
       // Language is currently the only application; new tenants start with it.
@@ -702,8 +702,8 @@ language.post('/projects', (req, res) => {
   }
   try {
     const info = db
-      .prepare('INSERT INTO projects (name, dialect, description, organization_id) VALUES (?, ?, ?, ?)')
-      .run(String(name).trim(), dialect || null, description || null, orgId);
+      .prepare('INSERT INTO projects (uid, name, dialect, description, organization_id) VALUES (?, ?, ?, ?, ?)')
+      .run(uuidv7(), String(name).trim(), dialect || null, description || null, orgId);
     res.status(201).json(db.prepare('SELECT * FROM projects WHERE id = ?').get(info.lastInsertRowid));
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return bad(res, 'A project with that name already exists');
@@ -1035,7 +1035,7 @@ language.get('/projects/:id/stats', (req, res) => {
 // role='translation' text, falling back to the legacy synced columns (kept
 // equal by syncEntryTexts during the compatibility window).
 const entrySelect = `
-  SELECT e.id, e.project_id, e.kind,
+  SELECT e.id, e.uid, e.project_id, e.kind,
          COALESCE((SELECT et.text FROM entry_texts et
                     WHERE et.entry_id = e.id AND et.is_primary = 1), e.dene_text) AS dene_text,
          COALESCE((SELECT et.text FROM entry_texts et
@@ -1260,10 +1260,10 @@ language.post('/entries', (req, res) => {
   if (!dene && !english) return bad(res, 'Enter Dene text, English text, or both');
   const info = db
     .prepare(
-      `INSERT INTO entries (project_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO entries (uid, project_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(projectId, kind, dene, english, source_doc?.trim() || null,
+    .run(uuidv7(), projectId, kind, dene, english, source_doc?.trim() || null,
          notes?.trim() || null, category?.trim() || null, req.user.id, req.user.id);
   syncEntryTexts(db, info.lastInsertRowid, req.user.id);
   storeEmbedding(info.lastInsertRowid, english);
@@ -1451,15 +1451,15 @@ function saveMasterRecording({ entry, userId, file, probe, sha256 = null, langua
     const id = db
       .prepare(
         `INSERT INTO audio_files
-           (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
+           (uid, entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
             language, speaker, recording_notes, uploaded_by,
             is_current, supersedes_audio_id, archive_class, sha256,
             sample_rate_hz, channels, bit_depth, codec, capture_method, capture_device,
             speaker_id, recording_session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
-        entry.id, storedName, file.originalname, file.mimetype || 'application/octet-stream',
+        uuidv7(), entry.id, storedName, file.originalname, file.mimetype || 'application/octet-stream',
         file.size, probe.duration, language, speaker, notes, userId,
         prior?.id ?? null, archiveClass, sha256, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
         captureMethod || null, captureDevice || null, speakerId, sessionId
@@ -2130,7 +2130,7 @@ language.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
   const kindArg = kind ? [kind] : [];
   const rows = db
     .prepare(
-      `SELECT e.id, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
+      `SELECT e.id, e.uid, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
               cu.name AS contributor, e.created_at, e.updated_at
        FROM entries e JOIN users cu ON cu.id = e.created_by
        WHERE e.project_id = ?${kindSql} ORDER BY e.id`
@@ -2227,7 +2227,7 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
 
   const rows = db
     .prepare(
-      `SELECT e.id, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
+      `SELECT e.id, e.uid, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
               cu.name AS contributor, e.created_at, e.updated_at
        FROM entries e JOIN users cu ON cu.id = e.created_by
        WHERE e.project_id = ?${kindSql} ORDER BY e.id`
@@ -2261,7 +2261,7 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
     )
     .get(req.project.id, ...kindArg);
   const orgRow = req.project.organization_id
-    ? db.prepare('SELECT id, name, slug FROM organizations WHERE id = ?').get(req.project.organization_id)
+    ? db.prepare('SELECT id, uid, name, slug FROM organizations WHERE id = ?').get(req.project.organization_id)
     : null;
 
   // Pre-scan files BEFORE we start streaming (headers commit on first byte): collect
@@ -2309,7 +2309,7 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
       audioByEntry.get(a.entry_id).push({ language: a.language, file: bundlePath });
     }
     recordingsJson.push({
-      audio_id: a.id, is_current: !!a.is_current, supersedes_audio_id: a.supersedes_audio_id,
+      audio_id: a.id, uid: a.uid, is_current: !!a.is_current, supersedes_audio_id: a.supersedes_audio_id,
       entry_id: a.entry_id, language: a.language, speaker: a.speaker, uploaded_by: a.uploaded_by_name,
       archive_class: a.archive_class, duration_seconds: a.duration_seconds,
       sample_rate_hz: a.sample_rate_hz, channels: a.channels, bit_depth: a.bit_depth, codec: a.codec,
@@ -2351,11 +2351,13 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
   }, null, 2);
   const recordingsJsonStr = JSON.stringify({ recordings: recordingsJson }, null, 2);
   const manifest = {
-    schema_version: '1.2',
+    // 1.3: stable uids on organization/project/entries/recordings — exported
+    // identity no longer depends on local row numbers (plan §9).
+    schema_version: '1.3',
     exported_at: new Date().toISOString(),
     application_version: pkg.version,
     organization: orgRow, // the data owner (#5)
-    project: { id: req.project.id, name: req.project.name, dialect: req.project.dialect },
+    project: { id: req.project.id, uid: req.project.uid, name: req.project.name, dialect: req.project.dialect },
     kind: kind || 'all',
     permission_filter: purpose || null,
     entry_count: rows.length,
@@ -2535,8 +2537,8 @@ language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next)
   );
   const sourceDoc = `CSV import: ${req.file.originalname}`;
   const insert = db.prepare(
-    `INSERT INTO entries (project_id, kind, dene_text, english_text, category, source_doc, created_by, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO entries (uid, project_id, kind, dene_text, english_text, category, source_doc, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   let imported = 0;
@@ -2553,7 +2555,7 @@ language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next)
       const key = JSON.stringify([dene, english]);
       if (seen.has(key)) { skippedDuplicates++; continue; }
       seen.add(key);
-      const row = insert.run(project.id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
+      const row = insert.run(uuidv7(), project.id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
       syncEntryTexts(db, row.lastInsertRowid, req.user.id);
       imported++;
     }
