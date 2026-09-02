@@ -1469,5 +1469,100 @@ if (BASE.includes('localhost')) {
   check('entitlement test user deleted (cleanup)', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- language abstraction: entry_texts mirror + read preference (plan §6) ---
+// Local-only: inspects the server's SQLite directly, like the hashed-session block.
+if (BASE.includes('localhost')) {
+  try {
+    const { default: db } = await import('../src/db.js');
+    const laName = `LangAbs ${Date.now()}`;
+    r = await sa.req('POST', '/api/projects', { name: laName, dialect: 'Tłı̨chǫ' });
+    const laProj = r.data.id;
+    r = await sa.req('POST', '/api/entries', {
+      project_id: laProj, kind: 'word', dene_text: 'sombak’è', english_text: 'money place',
+    });
+    const laEntry = r.data.id;
+    const texts = () => db.prepare(
+      `SELECT et.*, v.name AS variety, l.name AS language, l.code AS lang_code
+       FROM entry_texts et JOIN language_varieties v ON v.id = et.variety_id
+       JOIN languages l ON l.id = v.language_id WHERE et.entry_id = ? ORDER BY et.id`
+    ).all(laEntry);
+    let t = texts();
+    check('creating an entry mirrors both sides into entry_texts',
+      t.length === 2 && t.every((x) => x.uid), JSON.stringify(t.map((x) => x.text)));
+    check('the Dene side is the single primary text in the project-dialect variety',
+      t.find((x) => x.is_primary === 1)?.variety === 'Tłı̨chǫ' &&
+      t.find((x) => x.is_primary === 1)?.language === 'Dene');
+    check('the English side is a role=translation text in the English variety',
+      t.find((x) => x.role === 'translation')?.lang_code === 'en');
+
+    r = await sa.req('PATCH', `/api/entries/${laEntry}`, { english_text: '' });
+    check('blanking a side removes its mirrored entry_text', texts().length === 1);
+    r = await sa.req('PATCH', `/api/entries/${laEntry}`, { english_text: 'money place' });
+    check('restoring the side recreates the mirrored entry_text', texts().length === 2);
+
+    // Reads PREFER entry_texts: edit the primary text directly (bypassing the
+    // legacy columns) and the API must serve the entry_texts value.
+    db.prepare(`UPDATE entry_texts SET text = 'sǫǫ̀mbak’è' WHERE entry_id = ? AND is_primary = 1`).run(laEntry);
+    r = await sa.req('GET', `/api/entries/${laEntry}`);
+    check('reads prefer entry_texts over the legacy column', r.data.dene_text === 'sǫǫ̀mbak’è', r.data.dene_text);
+    // A write through the API re-syncs the mirror from the submitted values.
+    await sa.req('PATCH', `/api/entries/${laEntry}`, { dene_text: 'sombak’è' });
+    check('an API write re-syncs the mirrored text',
+      texts().find((x) => x.is_primary === 1)?.text === 'sombak’è');
+
+    // Coexistence: a third language and an alternate Dene realization can sit
+    // beside the mirrored pair without disturbing the bilingual API.
+    const { uuidv7 } = await import('../src/platform/uid.js');
+    const frLang = db.prepare(`INSERT INTO languages (uid, code, iso639_3, name) VALUES (?, 'fr', 'fra', 'French')`)
+      .run(uuidv7()).lastInsertRowid;
+    const frVar = db.prepare(`INSERT INTO language_varieties (uid, language_id, name) VALUES (?, ?, 'French')`)
+      .run(uuidv7(), frLang).lastInsertRowid;
+    const deneVar = texts().find((x) => x.is_primary === 1).variety_id;
+    db.prepare(`INSERT INTO entry_texts (uid, entry_id, variety_id, text, role) VALUES (?, ?, ?, 'place d’argent', 'translation')`)
+      .run(uuidv7(), laEntry, frVar);
+    db.prepare(`INSERT INTO entry_texts (uid, entry_id, variety_id, text, role) VALUES (?, ?, ?, 'sǫǫ̀mbak’è', 'alternate')`)
+      .run(uuidv7(), laEntry, deneVar);
+    check('an entry can hold texts in >2 languages and alternate realizations', texts().length === 4);
+    r = await sa.req('GET', `/api/entries/${laEntry}`);
+    check('extra texts do not disturb the bilingual API surface',
+      r.data.dene_text === 'sombak’è' && r.data.english_text === 'money place');
+
+    // Import mirrors too (one two-sided row + one one-sided row = 3 texts).
+    const csv = 'dene_text,english_text\nłue,fish\n,paddle\n';
+    const fd = new FormData();
+    fd.append('file', new Blob([csv], { type: 'text/csv' }), 'langabs.csv');
+    fd.append('kind', 'word');
+    r = await sa.req('POST', `/api/projects/${laProj}/import`, fd, true);
+    check('import creates entries', r.data.imported === 2, JSON.stringify(r.data));
+    const imported = db.prepare(
+      `SELECT COUNT(*) n FROM entry_texts et JOIN entries e ON e.id = et.entry_id
+       WHERE e.project_id = ? AND e.id <> ?`).get(laProj, laEntry).n;
+    check('import mirrors texts into entry_texts (3 texts for 2 rows)', imported === 3, imported);
+
+    // Global invariant sweep: across EVERY entry the suite created (direct
+    // edits, translate flow, work-item submits, imports), a non-empty legacy
+    // column always has an equal mirrored text.
+    const broken = db.prepare(`
+      SELECT COUNT(*) n FROM entries e
+      WHERE (e.dene_text <> '' AND NOT EXISTS (
+              SELECT 1 FROM entry_texts et WHERE et.entry_id = e.id AND et.is_primary = 1 AND et.text = e.dene_text))
+         OR (e.english_text <> '' AND NOT EXISTS (
+              SELECT 1 FROM entry_texts et JOIN language_varieties v ON v.id = et.variety_id
+              JOIN languages l ON l.id = v.language_id
+              WHERE et.entry_id = e.id AND l.code = 'en' AND et.role = 'translation' AND et.text = e.english_text))
+    `).get().n;
+    check('invariant: every non-empty legacy column is mirrored by an equal entry_text', broken === 0, broken);
+
+    // cleanup (entry_texts cascade with entries/projects)
+    await sa.req('DELETE', `/api/projects/${laProj}`, { confirm_name: laName });
+    db.prepare(`DELETE FROM language_varieties WHERE id = ?`).run(frVar);
+    db.prepare(`DELETE FROM languages WHERE id = ?`).run(frLang);
+    check('language-abstraction cleanup complete',
+      db.prepare(`SELECT COUNT(*) n FROM entry_texts WHERE entry_id = ?`).get(laEntry).n === 0);
+  } catch (e) {
+    check('language-abstraction block ran', false, e.stack || e.message);
+  }
+}
+
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');
 process.exit(failures ? 1 : 0);
