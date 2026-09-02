@@ -40,9 +40,12 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 3 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
-    applied[2].name === '003_speakers_sessions',
+    applied.length === 4 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids',
     JSON.stringify(applied));
+  check('fresh: uid unique indexes exist on transferable tables',
+    ['organizations', 'projects', 'entries', 'audio_files'].every((t) =>
+      db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'idx_${t}_uid'`).get()));
   check('fresh: checksums recorded', applied.every((m) => m.checksum?.length === 64));
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map((t) => t.name);
   for (const t of ['users', 'organizations', 'organization_apps', 'work_items', 'work_log', 'audio_files',
@@ -122,7 +125,13 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
   check('legacy: all migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 3);
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 4);
+  check('legacy: every org/project/entry/recording received a stable uid',
+    ['organizations', 'projects', 'entries', 'audio_files'].every((t) =>
+      db.prepare(`SELECT COUNT(*) n FROM ${t} WHERE uid IS NULL`).get().n === 0));
+  check('legacy: backfilled uids are well-formed UUIDv7',
+    /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      .test(db.prepare(`SELECT uid FROM entries WHERE id = 1`).get().uid));
   check('legacy: users preserved', db.prepare(`SELECT COUNT(*) n FROM users`).get().n === 1);
   check('legacy: entries preserved with text intact',
     db.prepare(`SELECT COUNT(*) n FROM entries`).get().n === 2 &&

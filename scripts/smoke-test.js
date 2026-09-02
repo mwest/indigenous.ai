@@ -1553,6 +1553,35 @@ if (BASE.includes('localhost')) {
   }
 }
 
+// --- stable uids (plan §9) ---
+{
+  const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const uidName = `Uid ${Date.now()}`;
+  r = await sa.req('POST', '/api/projects', { name: uidName, dialect: 'Dëne Sųłıné' });
+  const uidProj = r.data;
+  check('new projects are born with a UUIDv7 uid', UUID7.test(uidProj.uid ?? ''), uidProj.uid);
+  r = await sa.req('POST', '/api/entries', { project_id: uidProj.id, kind: 'word', dene_text: 'tu', english_text: 'water' });
+  check('new entries are born with a UUIDv7 uid', UUID7.test(r.data.uid ?? ''), r.data.uid);
+  const uidEntry = r.data.id;
+  const fdU = new FormData();
+  fdU.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'uid.wav');
+  fdU.append('language', 'dene');
+  r = await sa.req('POST', `/api/entries/${uidEntry}/audio`, fdU, true);
+  check('new recordings are born with a UUIDv7 uid', UUID7.test(r.data.uid ?? ''), r.data.uid);
+  // The owner archive carries uids so exported identity survives re-import.
+  const bundleTxt = (await sa.raw('GET', `/api/projects/${uidProj.id}/export-bundle`)).buf.toString('latin1');
+  check('export bundle embeds the entry and recording uids',
+    bundleTxt.includes('"schema_version": "1.3"') && bundleTxt.includes(uidProj.uid), 'uids not found in bundle');
+  await sa.req('DELETE', `/api/projects/${uidProj.id}`, { confirm_name: uidName });
+  if (BASE.includes('localhost')) {
+    const { default: db } = await import('../src/db.js');
+    const missing = ['organizations', 'projects', 'entries', 'audio_files']
+      .map((t) => db.prepare(`SELECT COUNT(*) n FROM ${t} WHERE uid IS NULL`).get().n)
+      .reduce((a, b) => a + b, 0);
+    check('invariant: no org/project/entry/recording lacks a uid', missing === 0, missing);
+  }
+}
+
 // --- language abstraction: entry_texts mirror + read preference (plan §6) ---
 // Local-only: inspects the server's SQLite directly, like the hashed-session block.
 if (BASE.includes('localhost')) {
