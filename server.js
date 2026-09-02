@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import db from './src/db.js';
 import { platform, language } from './src/api.js';
+import { COOKIE_NAME, userForToken } from './src/auth.js';
 import { APP_URL } from './src/mail.js';
 import { backfillEmbeddings } from './scripts/embed-backfill.js';
 import { backfillAudio } from './scripts/audio-backfill.js';
@@ -44,10 +45,16 @@ app.use((req, res, next) => {
 app.use('/api/platform', platform);
 app.use('/api/language', language);
 
-// Product root: straight into the app. The SPA shows the sign-in screen when
-// there is no session and the user's app (Language — the only one today)
-// when there is; old #/route bookmarks survive the redirect client-side.
-app.get('/', (req, res) => res.redirect('/language'));
+// Product root: THE sign-in page lives here. A signed-in visitor is forwarded
+// to their app (Language — the only one today; a last-used-app preference can
+// steer this when a second app exists); everyone else gets the login form,
+// which sends them to /language on success.
+app.get('/', (req, res) => {
+  if (userForToken(req.cookies[COOKIE_NAME])) return res.redirect('/language');
+  res.sendFile(path.join(PUBLIC_DIR, 'login.html'), {
+    headers: { 'Cache-Control': 'no-cache' },
+  });
+});
 
 // The Language application (SPA) lives at /language.
 // no-cache (revalidate every load) for code and markup so deploys show up
@@ -67,8 +74,8 @@ app.get('/language/{*splat}', (req, res) => {
     headers: { 'Cache-Control': 'no-cache' },
   });
 });
-// Anything else on the primary origin goes to the app too.
-app.get('/{*splat}', (req, res) => res.redirect('/language'));
+// Anything else on the primary origin goes to the root (login or app).
+app.get('/{*splat}', (req, res) => res.redirect('/'));
 
 const userCount = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
 
