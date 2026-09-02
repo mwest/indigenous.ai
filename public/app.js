@@ -9,7 +9,7 @@
 // else is the Language application API. (/me/compensation is Language, and so
 // are the org-scoped consent-profile routes — consent is a Language concern.)
 const PLATFORM_API =
-  /^\/(login$|logout$|password\/|me$|me\/(password|name)$|orgs$|orgs\/|users$|users\/)/;
+  /^\/(login$|logout$|password\/|me$|me\/(password|name)$|orgs$|orgs\/|users$|users\/|admin\/)/;
 const apiUrl = (path) =>
   (path.includes('/consent-profiles') || PLATFORM_API.test(path) === false
     ? '/api/language'
@@ -340,6 +340,7 @@ function renderTopbar() {
   bar.hidden = false;
   $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
   $('#nav-users').hidden = !state.me.user.is_superadmin;
+  $('#nav-orgs').hidden = !state.me.user.is_superadmin;
   $('#nav-jobs').hidden = !state.me.user.is_superadmin;
   $('#nav-compensation').hidden = !isOrgAdmin();
   $('#nav-org').hidden = !isOrgOwner();
@@ -2495,6 +2496,120 @@ async function renderMembers(projectId) {
 }
 
 // ---------------------------------------------------------------------------
+// Organizations view (superadmin) — platform provisioning: create tenants,
+// appoint their owner, toggle application entitlements. No corpus access.
+// ---------------------------------------------------------------------------
+
+async function renderOrgsAdmin() {
+  setActiveNav('orgs');
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let data;
+  try { data = await api('/admin/orgs'); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Organizations</h1>
+      <button id="new-org-btn">＋ New organization</button>
+    </div>
+    <div class="card">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Owners</th><th>Members</th><th>Projects</th><th>Language app</th><th>Created</th><th></th></tr></thead>
+        <tbody>
+          ${data.orgs.map((o) => `
+            <tr>
+              <td>${esc(o.name)}</td>
+              <td>${esc(o.owners ?? '—')}</td>
+              <td>${o.member_count}</td>
+              <td>${o.project_count}</td>
+              <td><span class="badge ${o.language_status === 'enabled' ? 'status-verified' : 'incomplete'}">${o.language_status}</span></td>
+              <td>${fmtDate(o.created_at)}</td>
+              <td style="white-space:nowrap">
+                <button class="ghost small" data-app-toggle="${o.id}" data-status="${o.language_status}" data-name="${esc(o.name)}">
+                  ${o.language_status === 'enabled' ? 'Disable Language' : 'Enable Language'}</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0">
+        Organizations own their corpus — platform administration grants no access to any
+        organization's data. Each organization's owner manages its projects, members,
+        consent profiles, and exports from their own <b>Organization</b> page.</p>
+    </div>`;
+
+  $('#new-org-btn').addEventListener('click', () => {
+    const m = openModal(`
+      <h2>New organization</h2>
+      <p style="color:var(--muted);font-size:0.9rem">The owner becomes the organization's
+        <b>owner admin</b>. If no account exists for that email, one is created and an
+        invite (set-password) email is sent. Language is enabled automatically.</p>
+      <form id="org-form">
+        <label class="field"><span>Organization name</span>
+          <input type="text" name="name" required placeholder="e.g. Tłı̨chǫ Government"></label>
+        <label class="field"><span>Owner email</span>
+          <input type="email" name="owner_email" placeholder="blank = you are the owner"></label>
+        <label class="field"><span>Owner name (for a new account)</span>
+          <input type="text" name="owner_name" placeholder="only needed if the account doesn't exist yet"></label>
+        <p class="error-msg" hidden></p>
+        <div class="form-actions">
+          <button type="submit">Create organization</button>
+          <button type="button" class="ghost" onclick="document.querySelector('.modal-backdrop').remove()">Cancel</button>
+        </div>
+      </form>`);
+    $('#org-form', m).addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const ownerEmail = f.owner_email.value.trim();
+      const createOrg = () => api('/orgs', {
+        method: 'POST',
+        body: { name: f.name.value, ...(ownerEmail ? { owner_email: ownerEmail } : {}) },
+      });
+      try {
+        let invite = null;
+        try {
+          await createOrg();
+        } catch (err) {
+          // Owner account doesn't exist yet: create it (invite flow) and retry.
+          if (!/no account/i.test(err.message) || !ownerEmail) throw err;
+          if (!f.owner_name.value.trim()) {
+            throw new Error('No account with that email — fill in the owner name to create one');
+          }
+          invite = await api('/users', {
+            method: 'POST',
+            body: { email: ownerEmail, name: f.owner_name.value.trim() },
+          });
+          await createOrg();
+        }
+        closeModal();
+        if (invite?.invite_link && !invite.invite_sent) {
+          prompt('Organization created, but the owner’s invite email could not be sent.\nCopy this set-password link and share it with them:', invite.invite_link);
+        } else {
+          toast(invite ? 'Organization created — owner invited by email' : 'Organization created');
+        }
+        await loadMe(); // the topbar org switcher may now have a new entry
+        renderTopbar();
+        renderOrgsAdmin();
+      } catch (err) { showFormError(f, err.message); }
+    });
+  });
+
+  view.onclick = async (e) => {
+    const btn = e.target.closest('button[data-app-toggle]');
+    if (!btn) return;
+    const enabled = btn.dataset.status === 'enabled';
+    if (enabled && !confirm(`Disable the Language application for "${btn.dataset.name}"?\nIts members lose access to the Language app until it is re-enabled; no data is touched.`)) return;
+    try {
+      await api(`/orgs/${btn.dataset.appToggle}/apps/language`, {
+        method: 'PUT',
+        body: { status: enabled ? 'disabled' : 'enabled' },
+      });
+      toast(enabled ? 'Language disabled for the organization' : 'Language enabled for the organization');
+      renderOrgsAdmin();
+    } catch (err) { toast(err.message, true); }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Users view (superadmin)
 // ---------------------------------------------------------------------------
 
@@ -2788,6 +2903,7 @@ function route() {
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
   else if (hash === '#/dashboard') renderDashboard();
   else if (hash === '#/users' && state.me.user.is_superadmin) renderUsers();
+  else if (hash === '#/orgs' && state.me.user.is_superadmin) renderOrgsAdmin();
   else if (hash === '#/jobs' && state.me.user.is_superadmin) renderJobs();
   else if ((m = hash.match(/^#\/jobs\/(\d+)$/)) && state.me.user.is_superadmin) renderJobDetail(m[1]);
   else if (hash === '#/compensation' && isOrgAdmin()) renderCompensation();
