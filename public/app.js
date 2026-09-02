@@ -1392,7 +1392,9 @@ function slotHtml(lang, a) {
       <div class="slot-head">${label}</div>
       ${a ? `
         <audio controls preload="none" src="/api/language/audio/${a.id}/stream"></audio>
-        <div class="slot-meta">${fmtDuration(a.duration_seconds)} · ${fmtDate(a.created_at)}</div>
+        <div class="slot-meta">${fmtDuration(a.duration_seconds)} · ${fmtDate(a.created_at)}${
+          a.speaker_name && a.speaker_name !== state.me.user.name
+            ? ` · spoken by <b>${esc(a.speaker_name)}</b>` : ''}</div>
         <div class="slot-controls">
           <button type="button" class="rec-btn small" data-lang="${lang}">⏺ Re-record</button>
           <button type="button" class="danger small" data-action="delete" data-id="${a.id}">Delete</button>
@@ -1526,10 +1528,12 @@ function audioItemHtml(a, entry) {
           · uploaded by ${esc(a.uploaded_by_name)} on ${fmtDate(a.created_at)}
         </span>
       </div>
-      ${a.speaker || a.recording_notes ? `
+      ${a.speaker_name || a.speaker || a.recording_notes ? `
         <div style="font-size:0.9rem;color:var(--muted)">
-          ${a.speaker ? `Speaker: <b>${esc(a.speaker)}</b>` : ''}
-          ${a.speaker && a.recording_notes ? ' · ' : ''}${esc(a.recording_notes ?? '')}
+          ${a.speaker_name
+            ? `Spoken by <b>${esc(a.speaker_name)}</b>${a.speaker_name !== a.uploaded_by_name ? ` · recorded by ${esc(a.uploaded_by_name)}` : ''}`
+            : a.speaker ? `Speaker: <b>${esc(a.speaker)}</b>` : ''}
+          ${(a.speaker_name || a.speaker) && a.recording_notes ? ' · ' : ''}${esc(a.recording_notes ?? '')}
         </div>` : ''}
       <audio controls preload="none" src="/api/language/audio/${a.id}/stream"></audio>
       ${canManage ? `
@@ -1653,7 +1657,75 @@ async function renderMyEarnings() {
 // Recording session — cycle through entries that have no audio yet
 // ---------------------------------------------------------------------------
 
-const recSession = { queue: [], pos: 0, total: 0, claimed: [] };
+const recSession = { queue: [], pos: 0, total: 0, claimed: [], sessionId: null, speakerName: null };
+
+// Close the server-side recording session (fire-and-forget) so its metadata
+// window ends when the contributor leaves the flow.
+function endRecSession() {
+  if (!recSession.sessionId) return;
+  const id = recSession.sessionId;
+  recSession.sessionId = null;
+  recSession.speakerName = null;
+  api(`/recording-sessions/${id}/end`, { method: 'POST' }).catch(() => {});
+}
+
+// One-time per session: who is speaking? Defaults to the signed-in user; a
+// facilitator picks (or registers) the person they are recording — an Elder
+// does not need an account. Resolves {sessionId, speakerName} or null.
+function chooseSpeaker(container, project) {
+  return new Promise((resolve) => {
+    (async () => {
+      let speakers = [];
+      try { speakers = (await api(`/projects/${project.id}/speakers`)).speakers; } catch { /* list is optional */ }
+      const others = speakers.filter((s) => s.user_id !== state.me.user.id);
+      container.innerHTML = `
+        <div class="card preflight">
+          <h2 style="margin-top:0">🗣️ Who is speaking?</h2>
+          <label class="field"><span>Speaker</span>
+            <select id="spk-select">
+              <option value="">Myself (${esc(state.me.user.name)})</option>
+              ${others.map((s) => `<option value="${s.id}">${esc(s.display_name)}</option>`).join('')}
+              <option value="__new">＋ New speaker…</option>
+            </select></label>
+          <label class="field" id="spk-new-wrap" hidden><span>Speaker's name</span>
+            <input id="spk-new-name" placeholder="e.g. an Elder's name"></label>
+          <p class="preflight-hint">You are the facilitator — the recording stays attributed to you as its uploader.</p>
+          <div class="rec-actions">
+            <button class="secondary" id="spk-cancel">Cancel</button>
+            <button id="spk-start">Start</button>
+          </div>
+        </div>`;
+      const select = $('#spk-select', container);
+      select.addEventListener('change', () => {
+        $('#spk-new-wrap', container).hidden = select.value !== '__new';
+      });
+      $('#spk-cancel', container).addEventListener('click', () => resolve(null));
+      $('#spk-start', container).addEventListener('click', async () => {
+        try {
+          let speakerId = null;
+          let speakerName = state.me.user.name;
+          if (select.value === '__new') {
+            const name = $('#spk-new-name', container).value.trim();
+            if (!name) { toast('Enter the speaker’s name', true); return; }
+            const created = await api(`/projects/${project.id}/speakers`, { method: 'POST', body: { display_name: name } });
+            speakerId = created.id;
+            speakerName = created.display_name;
+          } else if (select.value) {
+            speakerId = Number(select.value);
+            speakerName = others.find((s) => s.id === speakerId)?.display_name || speakerName;
+          }
+          const session = await api(`/projects/${project.id}/recording-sessions`, {
+            method: 'POST',
+            body: { speaker_id: speakerId, capture_device: micDeviceLabel || undefined },
+          });
+          resolve({ sessionId: session.id, speakerName });
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
+    })();
+  });
+}
 
 // Fire-and-forget release of any work items still claimed in a session (on Skip,
 // Exit, or navigating away) so a partly-finished batch doesn't stay locked for
@@ -1666,12 +1738,19 @@ function releaseClaims(session) {
 
 async function renderRecordSession() {
   setActiveNav('dashboard');
+  endRecSession(); // "Check for more" restarts: close any prior session first
   const p = activeProject();
   if (!p) { location.hash = '#/dashboard'; return; }
   // Quick mic check before we start claiming and cycling entries.
   const ok = await micPreflight(view);
   if (location.hash !== '#/record') return; // user navigated away during preflight
   if (!ok) { location.hash = '#/dashboard'; return; }
+  // Session setup (§8): choose the speaker once; every take inherits it.
+  const spk = await chooseSpeaker(view, p);
+  if (location.hash !== '#/record') return;
+  if (!spk) { location.hash = '#/dashboard'; return; }
+  recSession.sessionId = spk.sessionId;
+  recSession.speakerName = spk.speakerName;
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try {
@@ -1807,10 +1886,11 @@ function setupSessionRecorder(entry) {
     const fd = new FormData();
     fd.append('file', blob, `dene-entry${entry.id}-${stamp}.wav`);
     fd.append('language', 'dene');
-    fd.append('speaker', state.me.user.name);
+    fd.append('speaker', recSession.speakerName || state.me.user.name);
     fd.append('recording_notes', 'recorded in browser');
     fd.append('capture_method', 'browser_recording');
     if (micDeviceLabel) fd.append('capture_device', micDeviceLabel);
+    if (recSession.sessionId) fd.append('recording_session_id', recSession.sessionId);
     await api(`/work/${entry._wi}/submit`, { method: 'POST', body: fd });
     recSession.claimed = recSession.claimed.filter((wi) => wi !== entry._wi);
     URL.revokeObjectURL(blobUrl);
@@ -2624,6 +2704,7 @@ function route() {
   if (Recorder.session) Recorder.cancel(); // navigating away releases the mic
   releaseClaims(recSession); // return any unfinished claimed work to the queue
   releaseClaims(transSession);
+  endRecSession(); // leaving the flow closes the recording session
   const hash = location.hash || '#/dashboard'; // Dashboard is the home tab
   let m;
   // Views that work without a session:

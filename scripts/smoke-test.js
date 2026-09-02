@@ -1469,6 +1469,90 @@ if (BASE.includes('localhost')) {
   check('entitlement test user deleted (cleanup)', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- speakers & recording sessions (plan §7/§8) ---
+// Local-only (cleans up org-wide speaker rows directly in SQLite).
+if (BASE.includes('localhost')) {
+  try {
+    const { default: db } = await import('../src/db.js');
+    const spkProjName = `Spk ${Date.now()}`;
+    r = await sa.req('POST', '/api/projects', { name: spkProjName, dialect: 'Dëne Sųłıné' });
+    const spkProj = r.data.id;
+    r = await sa.req('POST', '/api/entries', {
+      project_id: spkProj, kind: 'word', dene_text: 'setsıé', english_text: 'my grandfather',
+    });
+    const spkEntry = r.data.id;
+
+    // A speaker who has NO user account.
+    r = await sa.req('POST', `/api/projects/${spkProj}/speakers`, { display_name: 'Elder Mary' });
+    check('a speaker can be registered without any user account', r.status === 201 && r.data.user_id === null);
+    const mary = r.data.id;
+    r = await sa.req('GET', `/api/projects/${spkProj}/speakers`);
+    check('speakers list shows the new speaker', r.data.speakers.some((s) => s.id === mary));
+
+    // Facilitator (sa) records Elder Mary through a session.
+    r = await sa.req('POST', `/api/projects/${spkProj}/recording-sessions`,
+      { speaker_id: mary, capture_device: 'Test Mic' });
+    check('recording session starts with the chosen speaker', r.status === 201 && r.data.speaker_name === 'Elder Mary');
+    const spkSession = r.data.id;
+    let fd = new FormData();
+    fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'mary.wav');
+    fd.append('language', 'dene');
+    fd.append('recording_session_id', String(spkSession));
+    r = await sa.req('POST', `/api/entries/${spkEntry}/audio`, fd, true);
+    check('recording saved through the session carries speaker + session + device',
+      r.data.speaker_id === mary && r.data.recording_session_id === spkSession &&
+      r.data.capture_device === 'Test Mic', JSON.stringify(r.data.speaker_id));
+    r = await sa.req('GET', `/api/entries/${spkEntry}`);
+    const maryAudio = r.data.audio.find((a) => a.language === 'dene');
+    check('provenance keeps BOTH the speaker and the uploader/facilitator',
+      maryAudio.speaker_name === 'Elder Mary' && maryAudio.uploaded_by_name !== 'Elder Mary');
+
+    // Without a session the voice defaults to the uploader's own self-speaker.
+    fd = new FormData();
+    fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'self.wav');
+    fd.append('language', 'english');
+    r = await sa.req('POST', `/api/entries/${spkEntry}/audio`, fd, true);
+    const selfSpeaker = db.prepare('SELECT user_id FROM speakers WHERE id = ?').get(r.data.speaker_id);
+    check('a sessionless upload is attributed to the uploader\'s self-speaker',
+      r.data.speaker_id && selfSpeaker?.user_id !== null && r.data.recording_session_id === null);
+
+    // Ending the session closes the metadata window.
+    r = await sa.req('POST', `/api/recording-sessions/${spkSession}/end`);
+    check('ending a session stamps ended_at', r.status === 200 && !!r.data.ended_at);
+    fd = new FormData();
+    fd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'late.wav');
+    fd.append('language', 'dene');
+    fd.append('recording_session_id', String(spkSession));
+    r = await sa.req('POST', `/api/entries/${spkEntry}/audio`, fd, true);
+    check('uploads against an ended session are rejected', r.status === 400, r.status);
+
+    // Linking a speaker to an account later (org admin), and the one-self-
+    // speaker-per-org guard.
+    const linkEmail = `spk-link-${Date.now()}@test.ca`;
+    await sa.req('POST', '/api/users', { email: linkEmail, name: 'Linked Speaker', password: 'spk-pass-1234' });
+    r = await sa.req('PATCH', `/api/speakers/${mary}`, { user_email: linkEmail });
+    check('a speaker can later be linked to a user account', r.status === 200 && r.data.user_id !== null);
+    r = await sa.req('POST', `/api/projects/${spkProj}/speakers`, { display_name: 'Duplicate Link' });
+    const dup = r.data.id;
+    r = await sa.req('PATCH', `/api/speakers/${dup}`, { user_email: linkEmail });
+    check('an account cannot back two speakers in one organization', r.status === 400, r.status);
+
+    // Sweep: every recording in the whole suite (migrated + new) has a speaker.
+    check('invariant: no recording is missing its speaker',
+      db.prepare('SELECT COUNT(*) n FROM audio_files WHERE speaker_id IS NULL').get().n === 0);
+
+    // cleanup: project (audio cascades), then the speaker/user rows.
+    await sa.req('DELETE', `/api/projects/${spkProj}`, { confirm_name: spkProjName });
+    const linkedUser = db.prepare('SELECT id FROM users WHERE email = ?').get(linkEmail);
+    db.prepare('DELETE FROM speakers WHERE id IN (?, ?)').run(mary, dup);
+    await sa.req('DELETE', `/api/users/${linkedUser.id}`);
+    check('speakers cleanup complete',
+      !db.prepare('SELECT 1 FROM speakers WHERE id IN (?, ?)').get(mary, dup));
+  } catch (e) {
+    check('speakers block ran', false, e.stack || e.message);
+  }
+}
+
 // --- language abstraction: entry_texts mirror + read preference (plan §6) ---
 // Local-only: inspects the server's SQLite directly, like the hashed-session block.
 if (BASE.includes('localhost')) {
