@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node server.js",
     "create-superadmin": "node scripts/create-superadmin.js",
-    "test": "node scripts/run-tests.js"
+    "test": "node scripts/run-tests.js",
+    "test:migrations": "node scripts/migration-test.js",
+    "migrations:status": "node scripts/migration-status.js"
   },
   "license": "UNLICENSED",
   "dependencies": {
