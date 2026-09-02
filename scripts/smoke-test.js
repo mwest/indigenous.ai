@@ -1553,6 +1553,63 @@ if (BASE.includes('localhost')) {
   }
 }
 
+// --- corpus / campaign separation (plan §10) ---
+// Local-only (shared-corpus cleanup needs direct SQLite access).
+if (BASE.includes('localhost')) {
+  try {
+    const { default: db } = await import('../src/db.js');
+    const ts = Date.now();
+    const nameA = `Corpus A ${ts}`;
+    r = await sa.req('POST', '/api/projects', { name: nameA, dialect: 'Dëne Sųłıné' });
+    const projA = r.data;
+    check('a new project is born with its own corpus (active campaign)',
+      !!projA.corpus_id && projA.status === 'active', JSON.stringify({ c: projA.corpus_id, s: projA.status }));
+    r = await sa.req('POST', '/api/entries', { project_id: projA.id, kind: 'word', dene_text: 'łue', english_text: 'fish' });
+    check('entries carry their corpus', r.data.corpus_id === projA.corpus_id);
+
+    // A second funding campaign contributes to the SAME permanent corpus.
+    r = await sa.req('POST', '/api/projects', { name: `Corpus B ${ts}`, dialect: 'Dëne Sųłıné', corpus_id: projA.corpus_id });
+    const projB = r.data;
+    check('a second campaign can join an existing corpus', projB.corpus_id === projA.corpus_id);
+    r = await sa.req('POST', '/api/entries', { project_id: projB.id, kind: 'word', dene_text: 'deh', english_text: 'river' });
+    check('the second campaign\'s entries land in the shared corpus', r.data.corpus_id === projA.corpus_id);
+
+    // Corpus-wide import dedup: campaign B must not re-import what A already holds.
+    const dupCsv = 'dene_text,english_text\nłue,fish\nk’i,birch\n';
+    const fdC = new FormData();
+    fdC.append('file', new Blob([dupCsv], { type: 'text/csv' }), 'campaignB.csv');
+    fdC.append('kind', 'word');
+    r = await sa.req('POST', `/api/projects/${projB.id}/import`, fdC, true);
+    check('import dedup is corpus-wide, not campaign-wide',
+      r.data.imported === 1 && r.data.skipped_duplicates === 1, JSON.stringify(r.data));
+
+    // Closing a campaign ends funded work but never touches the corpus.
+    r = await sa.req('PATCH', `/api/projects/${projA.id}`, { status: 'closed' });
+    check('a campaign can be closed', r.data.status === 'closed');
+    r = await sa.req('POST', `/api/projects/${projA.id}/work/claim`, { type: 'recording', language: 'dene', limit: 5 });
+    check('a closed campaign takes no new work claims', r.status === 400, r.status);
+    r = await sa.req('GET', `/api/entries?project_id=${projA.id}`);
+    check('the corpus data stays readable after campaign closure',
+      r.status === 200 && r.data.total >= 1, r.status);
+    check('the corpus row survives campaign closure',
+      !!db.prepare('SELECT 1 FROM corpora WHERE id = ?').get(projA.corpus_id));
+
+    // A campaign sharing its corpus cannot be deleted (corpus property).
+    r = await sa.req('DELETE', `/api/projects/${projA.id}`, { confirm_name: nameA });
+    check('deleting a campaign that shares its corpus is refused', r.status === 400, r.status);
+
+    // cleanup: retire campaign B surgically, then A (now sole) via the API —
+    // which takes the whole corpus with it, name-confirmed.
+    db.prepare('DELETE FROM entries WHERE project_id = ?').run(projB.id);
+    db.prepare('DELETE FROM projects WHERE id = ?').run(projB.id);
+    r = await sa.req('DELETE', `/api/projects/${projA.id}`, { confirm_name: nameA });
+    check('the corpus\'s only campaign can delete corpus and campaign together',
+      r.status === 200 && !db.prepare('SELECT 1 FROM corpora WHERE id = ?').get(projA.corpus_id));
+  } catch (e) {
+    check('corpus/campaign block ran', false, e.stack || e.message);
+  }
+}
+
 // --- stable uids (plan §9) ---
 {
   const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

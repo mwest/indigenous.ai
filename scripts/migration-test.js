@@ -40,8 +40,9 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 4 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
-    applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids',
+    applied.length === 5 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids' &&
+    applied[4].name === '005_corpora',
     JSON.stringify(applied));
   check('fresh: uid unique indexes exist on transferable tables',
     ['organizations', 'projects', 'entries', 'audio_files'].every((t) =>
@@ -50,7 +51,7 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map((t) => t.name);
   for (const t of ['users', 'organizations', 'organization_apps', 'work_items', 'work_log', 'audio_files',
                    'languages', 'language_varieties', 'orthographies', 'entry_texts',
-                   'speakers', 'recording_sessions']) {
+                   'speakers', 'recording_sessions', 'corpora']) {
     check(`fresh: table ${t} exists`, tables.includes(t));
   }
   check('fresh: English and Dene languages seeded',
@@ -125,7 +126,13 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
   check('legacy: all migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 4);
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 5);
+  // 005: one permanent corpus per legacy project; data stamped onto it.
+  check('legacy: a corpus was created from the project and everything is stamped',
+    db.prepare(`SELECT c.name FROM corpora c JOIN projects p ON p.corpus_id = c.id WHERE p.id = 1`)
+      .get()?.name === 'Legacy Project' &&
+    db.prepare(`SELECT COUNT(*) n FROM entries WHERE corpus_id IS NULL`).get().n === 0 &&
+    db.prepare(`SELECT status, currency FROM projects WHERE id = 1`).get()?.status === 'active');
   check('legacy: every org/project/entry/recording received a stable uid',
     ['organizations', 'projects', 'entries', 'audio_files'].every((t) =>
       db.prepare(`SELECT COUNT(*) n FROM ${t} WHERE uid IS NULL`).get().n === 0));
