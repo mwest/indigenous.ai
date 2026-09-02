@@ -40,12 +40,14 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 2 && applied[0].name === '001_baseline' && applied[1].name === '002_languages',
+    applied.length === 3 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied[2].name === '003_speakers_sessions',
     JSON.stringify(applied));
   check('fresh: checksums recorded', applied.every((m) => m.checksum?.length === 64));
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map((t) => t.name);
   for (const t of ['users', 'organizations', 'organization_apps', 'work_items', 'work_log', 'audio_files',
-                   'languages', 'language_varieties', 'orthographies', 'entry_texts']) {
+                   'languages', 'language_varieties', 'orthographies', 'entry_texts',
+                   'speakers', 'recording_sessions']) {
     check(`fresh: table ${t} exists`, tables.includes(t));
   }
   check('fresh: English and Dene languages seeded',
@@ -119,8 +121,8 @@ r = apply(legacyDir);
 check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
-  check('legacy: both migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 2);
+  check('legacy: all migrations recorded',
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 3);
   check('legacy: users preserved', db.prepare(`SELECT COUNT(*) n FROM users`).get().n === 1);
   check('legacy: entries preserved with text intact',
     db.prepare(`SELECT COUNT(*) n FROM entries`).get().n === 2 &&
@@ -160,6 +162,11 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
                 JOIN language_varieties v ON v.id = et.variety_id
                 JOIN languages l ON l.id = v.language_id
                 WHERE et.entry_id = 1 AND l.code = 'en' AND et.role = 'translation'`).get()?.text === 'how are you');
+  // 003: speaker backfill — the fixture recording's voice is its uploader.
+  check('legacy: a self-speaker was created for the uploader and stamped on the recording',
+    db.prepare(`SELECT s.user_id, s.display_name FROM audio_files a JOIN speakers s ON s.id = a.speaker_id
+                WHERE a.id = 1`).get()?.user_id === 1 &&
+    db.prepare(`SELECT COUNT(*) n FROM speakers`).get().n === 1);
   check('legacy: foreign_key_check clean', db.pragma('foreign_key_check').length === 0);
   db.close();
 }

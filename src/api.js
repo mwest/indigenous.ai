@@ -9,6 +9,8 @@ import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor, orgRol
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, classifyArchive } from './audio.js';
 import { syncEntryTexts } from './apps/language/texts.js';
+import { selfSpeakerFor, orgOfProject } from './apps/language/speakers.js';
+import { uuidv7 } from './platform/uid.js';
 import { createRequire } from 'node:module';
 import { backfillEmbeddings } from '../scripts/embed-backfill.js';
 import { APP_URL, inviteEmail, requestFormEmail, requestNotifyEmail, resetEmail, sendMail } from './mail.js';
@@ -1275,8 +1277,10 @@ language.get('/entries/:id', loadEntry, (req, res) => {
   // All project members see every recording.
   const audio = db
     .prepare(
-      `SELECT a.*, u.name AS uploaded_by_name FROM audio_files a
+      `SELECT a.*, u.name AS uploaded_by_name, s.display_name AS speaker_name
+       FROM audio_files a
        JOIN users u ON u.id = a.uploaded_by
+       LEFT JOIN speakers s ON s.id = a.speaker_id
        WHERE a.entry_id = ? AND a.is_current = 1
        ORDER BY a.language, a.created_at`
     )
@@ -1406,8 +1410,16 @@ const rmAudioFiles = (row) => audioFiles(row).forEach((f) => fs.rm(f, { force: t
 // current version (if any) is superseded, never overwritten or deleted. Kicks off
 // background derivative generation. Returns { audioId, hadCurrent }. Never bills —
 // callers decide billing (bill once, on the first version for a slot).
-function saveMasterRecording({ entry, userId, file, probe, sha256 = null, language, speaker, notes, captureMethod, captureDevice }) {
+function saveMasterRecording({ entry, userId, file, probe, sha256 = null, language, speaker, notes, captureMethod, captureDevice, speakerId = null, sessionId = null }) {
   const storedName = `masters/${userId}/${file.filename}`;
+  // Speaker identity (plan §7): every new recording carries a speaker_id. When
+  // no session names one, the voice is the uploader's own — get-or-create
+  // their self-speaker in the project's organization. uploaded_by stays as
+  // the facilitator/provenance either way.
+  if (!speakerId) {
+    const orgId = orgOfProject(db, entry.project_id);
+    if (orgId) speakerId = selfSpeakerFor(db, orgId, userId);
+  }
   const prior = db
     .prepare('SELECT * FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
     .get(entry.id, userId, language);
@@ -1442,14 +1454,15 @@ function saveMasterRecording({ entry, userId, file, probe, sha256 = null, langua
            (entry_id, stored_name, original_name, mime_type, size_bytes, duration_seconds,
             language, speaker, recording_notes, uploaded_by,
             is_current, supersedes_audio_id, archive_class, sha256,
-            sample_rate_hz, channels, bit_depth, codec, capture_method, capture_device)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            sample_rate_hz, channels, bit_depth, codec, capture_method, capture_device,
+            speaker_id, recording_session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         entry.id, storedName, file.originalname, file.mimetype || 'application/octet-stream',
         file.size, probe.duration, language, speaker, notes, userId,
         prior?.id ?? null, archiveClass, sha256, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
-        captureMethod || null, captureDevice || null
+        captureMethod || null, captureDevice || null, speakerId, sessionId
       ).lastInsertRowid;
     if (consent) {
       db.prepare(
@@ -1488,12 +1501,19 @@ language.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, a
     return bad(res, 'Could not read that audio file — it may be corrupt or in an unsupported format. The entry was not changed.');
   }
 
+  const { session, error: sessionError } = sessionForUpload(req, req.entry.project_id);
+  if (sessionError) {
+    fs.rm(filePath, { force: true }, () => {});
+    return bad(res, sessionError);
+  }
   const { audioId, hadCurrent } = saveMasterRecording({
     entry: req.entry, userId: req.user.id, file: req.file, probe, sha256, language,
     speaker: req.body.speaker?.trim() || null,
     notes: req.body.recording_notes?.trim() || null,
     captureMethod: req.body.capture_method === 'browser_recording' ? 'browser_recording' : 'uploaded_file',
-    captureDevice: req.body.capture_device?.trim() || null,
+    captureDevice: req.body.capture_device?.trim() || session?.capture_device || null,
+    speakerId: session?.speaker_id ?? null,
+    sessionId: session?.id ?? null,
   });
   enqueueDerivative(audioId);
   // Direct uploads are NOT billable: paid work flows exclusively through
@@ -1501,6 +1521,124 @@ language.post('/entries/:id/audio', loadEntry, rejectTranslators, audioUpload, a
   res.status(hadCurrent ? 200 : 201)
     .json({ ...db.prepare('SELECT * FROM audio_files WHERE id = ?').get(audioId), replaced: hadCurrent });
 });
+
+// ---------------------------------------------------------------------------
+// Speakers & recording sessions (plan §7/§8). The SPEAKER is whose voice is on
+// a recording; the UPLOADER (facilitator) is who operated the device. A
+// speaker needs no user account; every project role may register speakers and
+// run sessions (facilitators are usually translators or members).
+// ---------------------------------------------------------------------------
+
+function requireProjectRole(req, res) {
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(Number(req.params.id));
+  if (!project) { bad(res, 'Project not found', 404); return null; }
+  if (!roleIn(req.user, project.id)) { bad(res, 'Not a member of this project', 403); return null; }
+  return project;
+}
+
+language.get('/projects/:id/speakers', (req, res) => {
+  const project = requireProjectRole(req, res);
+  if (!project) return;
+  const speakers = db.prepare(
+    `SELECT s.id, s.uid, s.display_name, s.user_id, s.notes, u.name AS user_name
+     FROM speakers s LEFT JOIN users u ON u.id = s.user_id
+     WHERE s.organization_id = ? ORDER BY s.display_name`
+  ).all(project.organization_id);
+  res.json({ speakers });
+});
+
+language.post('/projects/:id/speakers', (req, res) => {
+  const project = requireProjectRole(req, res);
+  if (!project) return;
+  const name = String(req.body?.display_name ?? '').trim();
+  if (!name) return bad(res, 'A speaker name is required');
+  const id = db.prepare(
+    'INSERT INTO speakers (uid, organization_id, display_name, notes) VALUES (?, ?, ?, ?)'
+  ).run(uuidv7(), project.organization_id, name, req.body?.notes?.trim() || null).lastInsertRowid;
+  res.status(201).json(db.prepare('SELECT * FROM speakers WHERE id = ?').get(id));
+});
+
+// Rename, annotate, or link a speaker to an existing account (org admins).
+language.patch('/speakers/:id', (req, res) => {
+  const speaker = db.prepare('SELECT * FROM speakers WHERE id = ?').get(req.params.id);
+  if (!speaker) return bad(res, 'Speaker not found', 404);
+  if (!isOrgAdmin(req.user, speaker.organization_id)) return bad(res, 'Organization admin access required', 403);
+  let userId = speaker.user_id;
+  if (req.body?.user_email !== undefined) {
+    if (req.body.user_email === null || req.body.user_email === '') userId = null;
+    else {
+      const user = db.prepare('SELECT id FROM users WHERE email = ?').get(String(req.body.user_email).trim());
+      if (!user) return bad(res, 'No account with that email');
+      userId = user.id;
+    }
+  }
+  const name = req.body?.display_name !== undefined
+    ? String(req.body.display_name).trim() : speaker.display_name;
+  if (!name) return bad(res, 'A speaker name is required');
+  try {
+    db.prepare(
+      `UPDATE speakers SET display_name = ?, notes = ?, user_id = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(name, req.body?.notes !== undefined ? (req.body.notes?.trim() || null) : speaker.notes,
+          userId, speaker.id);
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) {
+      return bad(res, 'That account is already linked to another speaker in this organization');
+    }
+    throw e;
+  }
+  res.json(db.prepare('SELECT * FROM speakers WHERE id = ?').get(speaker.id));
+});
+
+// Start a session: pick the speaker (default: yourself) and device once;
+// every take saved with the session inherits that metadata.
+language.post('/projects/:id/recording-sessions', (req, res) => {
+  const project = requireProjectRole(req, res);
+  if (!project) return;
+  let speakerId = Number(req.body?.speaker_id || 0) || null;
+  if (speakerId) {
+    const speaker = db.prepare('SELECT organization_id FROM speakers WHERE id = ?').get(speakerId);
+    if (!speaker || speaker.organization_id !== project.organization_id) {
+      return bad(res, 'Speaker not found in this organization');
+    }
+  } else {
+    speakerId = selfSpeakerFor(db, project.organization_id, req.user.id);
+  }
+  const id = db.prepare(
+    `INSERT INTO recording_sessions
+       (uid, project_id, speaker_id, facilitator_user_id, capture_device, capture_method, notes)
+     VALUES (?, ?, ?, ?, ?, 'browser_recording', ?)`
+  ).run(uuidv7(), project.id, speakerId, req.user.id,
+        req.body?.capture_device?.trim() || null, req.body?.notes?.trim() || null).lastInsertRowid;
+  res.status(201).json(db.prepare(
+    `SELECT rs.*, s.display_name AS speaker_name FROM recording_sessions rs
+     JOIN speakers s ON s.id = rs.speaker_id WHERE rs.id = ?`
+  ).get(id));
+});
+
+language.post('/recording-sessions/:id/end', (req, res) => {
+  const session = db.prepare('SELECT * FROM recording_sessions WHERE id = ?').get(req.params.id);
+  if (!session) return bad(res, 'Recording session not found', 404);
+  const isFacilitator = session.facilitator_user_id === req.user.id;
+  if (!isFacilitator && roleIn(req.user, session.project_id) !== 'admin') {
+    return bad(res, 'Not your recording session', 403);
+  }
+  if (!session.ended_at) {
+    db.prepare(`UPDATE recording_sessions SET ended_at = datetime('now') WHERE id = ?`).run(session.id);
+  }
+  res.json(db.prepare('SELECT * FROM recording_sessions WHERE id = ?').get(session.id));
+});
+
+/** Resolve an optional recording_session_id on an upload: must belong to the
+ *  entry's project, be run by the caller, and still be open. */
+function sessionForUpload(req, projectId) {
+  const sid = Number(req.body.recording_session_id || 0);
+  if (!sid) return { session: null };
+  const session = db.prepare('SELECT * FROM recording_sessions WHERE id = ?').get(sid);
+  if (!session || session.project_id !== projectId) return { error: 'Recording session not found for this project' };
+  if (session.facilitator_user_id !== req.user.id) return { error: 'Not your recording session' };
+  if (session.ended_at) return { error: 'This recording session has ended' };
+  return { session };
+}
 
 function loadAudio(req, res, next) {
   const audio = db.prepare('SELECT * FROM audio_files WHERE id = ?').get(req.params.id);
@@ -1884,6 +2022,11 @@ language.post('/work/:id/submit', loadWorkItem, (req, res) => {
       : db
           .prepare('SELECT id FROM audio_files WHERE entry_id = ? AND uploaded_by = ? AND language = ? AND is_current = 1')
           .get(entry.id, req.user.id, language);
+    const { session, error: sessionError } = sessionForUpload(req, entry.project_id);
+    if (sessionError) {
+      fs.rm(filePath, { force: true }, () => {});
+      return bad(res, sessionError);
+    }
     let savedAudioId = null;
     try {
       db.transaction(() => {
@@ -1898,7 +2041,9 @@ language.post('/work/:id/submit', loadWorkItem, (req, res) => {
             speaker: req.body.speaker?.trim() || null,
             notes: req.body.recording_notes?.trim() || null,
             captureMethod: 'browser_recording',
-            captureDevice: req.body.capture_device?.trim() || null,
+            captureDevice: req.body.capture_device?.trim() || session?.capture_device || null,
+            speakerId: session?.speaker_id ?? null,
+            sessionId: session?.id ?? null,
           });
           savedAudioId = audioId;
           acceptWorkItem(item.id);
