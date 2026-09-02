@@ -24,6 +24,13 @@ Module ownership for new code (a direction, not a mandate to move working code):
   `/api/language/...` (the `language` router in `src/api.js`). Routes are gated by the
   org-level `language` app entitlement.
 
+Within Language, the **corpus** is the permanent home of the language data (entries,
+recordings, sessions belong to it); a **project is a campaign** of funded work on a
+corpus. Multiple campaigns may contribute to one corpus (`POST /projects` with
+`corpus_id`), import dedup is corpus-wide, closing a campaign (`status: 'closed'`)
+stops new work claims without touching the corpus, and a campaign sharing its corpus
+cannot be deleted — only a corpus's sole campaign may delete both, name-confirmed.
+
 Organization identity is platform-wide; operational permissions are application-scoped.
 Do not treat a Language role (e.g. `translator`) as a platform role, and do not
 generalize Language domain concepts (speakers, corpora, orthographies) into platform

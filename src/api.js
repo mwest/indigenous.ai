@@ -8,7 +8,7 @@ import { parseFile } from 'music-metadata';
 import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor, orgRole, orgsFor } from './db.js';
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, classifyArchive } from './audio.js';
-import { syncEntryTexts } from './apps/language/texts.js';
+import { syncEntryTexts, varietyForDialect } from './apps/language/texts.js';
 import { selfSpeakerFor, orgOfProject } from './apps/language/speakers.js';
 import { uuidv7 } from './platform/uid.js';
 import { createRequire } from 'node:module';
@@ -700,10 +700,28 @@ language.post('/projects', (req, res) => {
   } else {
     return bad(res, 'You administer multiple organizations — specify organization_id');
   }
+  // Corpus / campaign separation (plan §10): the corpus is the permanent home
+  // of the language data; this project is a campaign of work on it. Pass
+  // corpus_id to add a new campaign to an EXISTING corpus (same org);
+  // otherwise a corpus is created alongside the project.
+  let corpusId = req.body?.corpus_id ? Number(req.body.corpus_id) : null;
+  if (corpusId) {
+    const corpus = db.prepare('SELECT organization_id FROM corpora WHERE id = ?').get(corpusId);
+    if (!corpus || corpus.organization_id !== orgId) return bad(res, 'Corpus not found in that organization');
+  }
   try {
-    const info = db
-      .prepare('INSERT INTO projects (uid, name, dialect, description, organization_id) VALUES (?, ?, ?, ?, ?)')
-      .run(uuidv7(), String(name).trim(), dialect || null, description || null, orgId);
+    const info = db.transaction(() => {
+      if (!corpusId) {
+        corpusId = db.prepare(
+          `INSERT INTO corpora (uid, organization_id, name, primary_variety_id)
+           VALUES (?, ?, ?, ?)`
+        ).run(uuidv7(), orgId, String(name).trim(),
+              varietyForDialect(db, dialect || null)).lastInsertRowid;
+      }
+      return db
+        .prepare('INSERT INTO projects (uid, name, dialect, description, organization_id, corpus_id) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(uuidv7(), String(name).trim(), dialect || null, description || null, orgId, corpusId);
+    })();
     res.status(201).json(db.prepare('SELECT * FROM projects WHERE id = ?').get(info.lastInsertRowid));
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return bad(res, 'A project with that name already exists');
@@ -713,12 +731,19 @@ language.post('/projects', (req, res) => {
 
 language.patch('/projects/:id', requireOrgAdminOfProject, (req, res) => {
   const project = req.project;
-  const { name, dialect, description } = req.body ?? {};
+  const { name, dialect, description, status } = req.body ?? {};
+  // Campaign lifecycle (plan §10): CLOSING a campaign ends its funded work
+  // (no new claims) but never touches the corpus — entries and recordings
+  // stay readable and exportable. Reopening is allowed.
+  if (status !== undefined && !['active', 'closed'].includes(status)) {
+    return bad(res, "Status must be 'active' or 'closed'");
+  }
   try {
-    db.prepare('UPDATE projects SET name = ?, dialect = ?, description = ? WHERE id = ?').run(
+    db.prepare('UPDATE projects SET name = ?, dialect = ?, description = ?, status = ? WHERE id = ?').run(
       name?.trim() || project.name,
       dialect !== undefined ? (dialect?.trim() || null) : project.dialect,
       description !== undefined ? (description?.trim() || null) : project.description,
+      status !== undefined ? status : project.status,
       project.id
     );
   } catch (e) {
@@ -736,6 +761,18 @@ language.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
   if (confirm_name !== project.name) {
     return bad(res, 'Type the exact project name to confirm deletion');
   }
+  // Corpus invariant (plan §10): a campaign that shares its corpus with other
+  // campaigns cannot be deleted — its entries are corpus property that the
+  // sibling campaigns still work on. Close it instead. A corpus's ONLY
+  // campaign keeps today's explicit destroy-everything semantics (the owner
+  // deleting the whole corpus, name-confirmed).
+  const siblings = project.corpus_id
+    ? db.prepare('SELECT COUNT(*) n FROM projects WHERE corpus_id = ? AND id <> ?')
+        .get(project.corpus_id, project.id).n
+    : 0;
+  if (siblings > 0) {
+    return bad(res, 'Other campaigns share this corpus — close this one instead of deleting it');
+  }
 
   const files = db
     .prepare(
@@ -748,6 +785,8 @@ language.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
     // audio_files rows cascade from entries; memberships cascade from projects
     deletedEntries = db.prepare('DELETE FROM entries WHERE project_id = ?').run(project.id).changes;
     db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
+    // Sole campaign: the corpus dies with it (checked above).
+    if (project.corpus_id) db.prepare('DELETE FROM corpora WHERE id = ?').run(project.corpus_id);
   })();
   for (const f of files) rmAudioFiles(f); // remove every version's master + derivative
   res.json({ ok: true, deleted_entries: deletedEntries, deleted_recordings: files.length });
@@ -1035,7 +1074,7 @@ language.get('/projects/:id/stats', (req, res) => {
 // role='translation' text, falling back to the legacy synced columns (kept
 // equal by syncEntryTexts during the compatibility window).
 const entrySelect = `
-  SELECT e.id, e.uid, e.project_id, e.kind,
+  SELECT e.id, e.uid, e.project_id, e.corpus_id, e.kind,
          COALESCE((SELECT et.text FROM entry_texts et
                     WHERE et.entry_id = e.id AND et.is_primary = 1), e.dene_text) AS dene_text,
          COALESCE((SELECT et.text FROM entry_texts et
@@ -1260,10 +1299,10 @@ language.post('/entries', (req, res) => {
   if (!dene && !english) return bad(res, 'Enter Dene text, English text, or both');
   const info = db
     .prepare(
-      `INSERT INTO entries (uid, project_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO entries (uid, project_id, corpus_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
+       VALUES (?, ?, (SELECT corpus_id FROM projects WHERE id = ?), ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(uuidv7(), projectId, kind, dene, english, source_doc?.trim() || null,
+    .run(uuidv7(), projectId, projectId, kind, dene, english, source_doc?.trim() || null,
          notes?.trim() || null, category?.trim() || null, req.user.id, req.user.id);
   syncEntryTexts(db, info.lastInsertRowid, req.user.id);
   storeEmbedding(info.lastInsertRowid, english);
@@ -1605,9 +1644,9 @@ language.post('/projects/:id/recording-sessions', (req, res) => {
   }
   const id = db.prepare(
     `INSERT INTO recording_sessions
-       (uid, project_id, speaker_id, facilitator_user_id, capture_device, capture_method, notes)
-     VALUES (?, ?, ?, ?, ?, 'browser_recording', ?)`
-  ).run(uuidv7(), project.id, speakerId, req.user.id,
+       (uid, project_id, corpus_id, speaker_id, facilitator_user_id, capture_device, capture_method, notes)
+     VALUES (?, ?, ?, ?, ?, ?, 'browser_recording', ?)`
+  ).run(uuidv7(), project.id, project.corpus_id, speakerId, req.user.id,
         req.body?.capture_device?.trim() || null, req.body?.notes?.trim() || null).lastInsertRowid;
   res.status(201).json(db.prepare(
     `SELECT rs.*, s.display_name AS speaker_name FROM recording_sessions rs
@@ -1850,6 +1889,12 @@ language.post('/projects/:id/work/claim', (req, res) => {
   const projectId = Number(req.params.id);
   const role = roleIn(req.user, projectId);
   if (!role) return bad(res, 'Not a member of this project', 403);
+  // A CLOSED campaign takes no new funded work; its corpus stays readable and
+  // exportable (plan §10). In-flight claims still submit/release normally.
+  const campaign = db.prepare('SELECT status FROM projects WHERE id = ?').get(projectId);
+  if (campaign?.status === 'closed') {
+    return bad(res, 'This campaign is closed — no new work can be claimed');
+  }
   const type = req.body?.type;
   if (type !== 'translation' && type !== 'recording') return bad(res, 'Invalid work type');
   const language = type === 'recording' ? (req.body?.language === 'english' ? 'english' : 'dene') : null;
@@ -2357,7 +2402,10 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
     exported_at: new Date().toISOString(),
     application_version: pkg.version,
     organization: orgRow, // the data owner (#5)
-    project: { id: req.project.id, uid: req.project.uid, name: req.project.name, dialect: req.project.dialect },
+    corpus: req.project.corpus_id
+      ? db.prepare('SELECT id, uid, name FROM corpora WHERE id = ?').get(req.project.corpus_id) ?? null
+      : null,
+    project: { id: req.project.id, uid: req.project.uid, name: req.project.name, dialect: req.project.dialect, status: req.project.status },
     kind: kind || 'all',
     permission_filter: purpose || null,
     entry_count: rows.length,
@@ -2527,18 +2575,22 @@ language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next)
     return bad(res, `Too many rows (${dataRows.length}) — max ${MAX_IMPORT_ROWS} per import. Split the file and try again.`);
   }
 
-  // Idempotent: skip pairs that already exist in the project, and duplicates
-  // within the file itself.
-  // Dedup is scoped by kind so the same text may exist as both a word and a phrase.
+  // Idempotent: skip pairs that already exist, and duplicates within the file
+  // itself. Dedup is scoped by kind (the same text may exist as both a word
+  // and a phrase) and by CORPUS, not campaign — a new funding campaign on the
+  // same corpus must not re-import the corpus's existing entries (plan §10).
   const seen = new Set(
-    db.prepare('SELECT dene_text, english_text FROM entries WHERE project_id = ? AND kind = ?')
-      .all(project.id, kind)
+    (project.corpus_id
+      ? db.prepare('SELECT dene_text, english_text FROM entries WHERE corpus_id = ? AND kind = ?')
+          .all(project.corpus_id, kind)
+      : db.prepare('SELECT dene_text, english_text FROM entries WHERE project_id = ? AND kind = ?')
+          .all(project.id, kind))
       .map((e) => JSON.stringify([e.dene_text, e.english_text]))
   );
   const sourceDoc = `CSV import: ${req.file.originalname}`;
   const insert = db.prepare(
-    `INSERT INTO entries (uid, project_id, kind, dene_text, english_text, category, source_doc, created_by, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO entries (uid, project_id, corpus_id, kind, dene_text, english_text, category, source_doc, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   let imported = 0;
@@ -2555,7 +2607,7 @@ language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next)
       const key = JSON.stringify([dene, english]);
       if (seen.has(key)) { skippedDuplicates++; continue; }
       seen.add(key);
-      const row = insert.run(uuidv7(), project.id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
+      const row = insert.run(uuidv7(), project.id, project.corpus_id, kind, dene, english, category, sourceDoc, req.user.id, req.user.id);
       syncEntryTexts(db, row.lastInsertRowid, req.user.id);
       imported++;
     }
