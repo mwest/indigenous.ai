@@ -41,6 +41,7 @@ body {
 }
 .brand { font-weight: 700; font-size: 1.05rem; white-space: nowrap; }
 .brand-mark { margin-right: 0.25rem; }
+.brand-app { font-weight: 500; color: var(--accent, #8a4b2f); }
 #topbar nav { display: flex; gap: 0.25rem; flex-wrap: wrap; }
 #topbar nav a {
   text-decoration: none;

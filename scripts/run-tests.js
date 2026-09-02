@@ -34,7 +34,7 @@ async function waitForServer() {
   while (Date.now() - started < 60_000) {
     if (serverExited) throw new Error('server died before answering');
     try {
-      const r = await fetch(`${BASE}/api/me`);
+      const r = await fetch(`${BASE}/api/platform/me`);
       if (r.status === 401) return;
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 300));

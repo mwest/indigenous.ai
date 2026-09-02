@@ -565,6 +565,27 @@ if (db.pragma('user_version', { simple: true }) < 1) {
   db.pragma('user_version = 1');
 }
 
+// Migration (Indigenous.ai Phase 0): organization-level application entitlements.
+// Organizations are Indigenous.ai platform tenants; membership in an org must
+// not imply access to every future application. 'language' is the first (and
+// currently only) application — seeded enabled for every existing organization.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS organization_apps (
+    organization_id  INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    app_code         TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled', 'disabled')),
+    settings_json    TEXT,
+    enabled_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    disabled_at      TEXT,
+    PRIMARY KEY (organization_id, app_code)
+  )
+`);
+db.exec(`
+  INSERT INTO organization_apps (organization_id, app_code)
+  SELECT id, 'language' FROM organizations WHERE true
+  ON CONFLICT(organization_id, app_code) DO NOTHING
+`);
+
 export default db;
 
 // ---- Role helpers -------------------------------------------------------
