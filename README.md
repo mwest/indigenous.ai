@@ -24,12 +24,23 @@ Module ownership for new code (a direction, not a mandate to move working code):
   `/api/language/...` (the `language` router in `src/api.js`). Routes are gated by the
   org-level `language` app entitlement.
 
-Within Language, the **corpus** is the permanent home of the language data (entries,
-recordings, sessions belong to it); a **project is a campaign** of funded work on a
-corpus. Multiple campaigns may contribute to one corpus (`POST /projects` with
-`corpus_id`), import dedup is corpus-wide, closing a campaign (`status: 'closed'`)
-stops new work claims without touching the corpus, and a campaign sharing its corpus
-cannot be deleted — only a corpus's sole campaign may delete both, name-confirmed.
+Within Language, the **corpus OWNS the permanent language data** — entries,
+recordings, and sessions belong to it; `entries.project_id` is origin/provenance
+(which campaign created or imported the entry), never ownership. A **project is a
+campaign** of funded work on a corpus: entry visibility, search, stats, work
+discovery, consent assignment, and exports are all corpus-scoped (a campaign works
+its whole corpus, including entries created by sibling campaigns), while work items,
+rates, and compensation stay campaign-attributed. Multiple campaigns may contribute
+to one corpus (`POST /projects` with `corpus_id`, same organization only); import
+dedup is corpus-wide; closing a campaign (`status: 'closed'`) stops new work claims
+without touching the corpus; a campaign sharing its corpus cannot be deleted — only
+a corpus's sole campaign may delete both, name-confirmed.
+
+Application entitlement is enforced against the organization that **owns the
+resource** (`organizationHasApp` in `src/platform/entitlements.js`): Language
+enabled in one organization never authorizes another organization's data, and
+list/search surfaces intersect visibility with entitled organizations. A missing
+`organization_apps` row means disabled.
 
 Organization identity is platform-wide; operational permissions are application-scoped.
 Do not treat a Language role (e.g. `translator`) as a platform role, and do not
