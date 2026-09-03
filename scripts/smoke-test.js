@@ -1559,6 +1559,88 @@ if (BASE.includes('localhost')) {
   }
 }
 
+// --- resource-level entitlement isolation (two-fixes §1) ---
+// A user in Org A (Language enabled) AND Org B (disabled) must reach A's
+// resources and be shut out of B's — an entitlement anywhere never authorizes
+// another org's data. Local-only (missing-row case pokes SQLite directly).
+if (BASE.includes('localhost')) {
+  try {
+    const { default: db } = await import('../src/db.js');
+    const ts = Date.now();
+    r = await sa.req('POST', '/api/orgs', { name: `EntIso A ${ts}` });
+    const orgA = r.data.id;
+    r = await sa.req('POST', '/api/orgs', { name: `EntIso B ${ts}` });
+    const orgB = r.data.id;
+    r = await sa.req('POST', '/api/projects', { name: `EntIso ProjA ${ts}`, organization_id: orgA });
+    const projA = r.data.id;
+    r = await sa.req('POST', '/api/projects', { name: `EntIso ProjB ${ts}`, organization_id: orgB });
+    const projB = r.data.id;
+    r = await sa.req('POST', '/api/entries', { project_id: projA, kind: 'phrase', dene_text: 'A-side' });
+    const entryA = r.data.id;
+    r = await sa.req('POST', '/api/entries', { project_id: projB, kind: 'phrase', dene_text: 'B-side' });
+    const entryB = r.data.id;
+    const isoEmail = `iso-${ts}@test.ca`;
+    await sa.req('POST', `/api/projects/${projA}/members`, { email: isoEmail, name: 'Iso User', password: 'iso-pass-1234' });
+    await sa.req('POST', `/api/projects/${projB}/members`, { email: isoEmail });
+    const iso = client();
+    await iso.req('POST', '/api/login', { email: isoEmail, password: 'iso-pass-1234' });
+
+    r = await sa.req('PUT', `/api/orgs/${orgB}/apps/language`, { status: 'disabled' });
+    check('iso: Org B Language disabled', r.status === 200);
+
+    r = await iso.req('GET', '/api/projects');
+    check('iso: project list keeps Org A, excludes disabled Org B',
+      r.data.projects.some((p) => p.id === projA) && !r.data.projects.some((p) => p.id === projB));
+    r = await iso.req('GET', '/api/entries');
+    check('iso: entry list excludes the disabled org\'s entries',
+      r.data.entries.some((e) => e.id === entryA) && !r.data.entries.some((e) => e.id === entryB));
+    r = await iso.req('GET', `/api/entries/${entryB}`);
+    check('iso: disabled-org entry detail is 403', r.status === 403, r.status);
+    r = await iso.req('GET', `/api/entries/${entryA}`);
+    check('iso: enabled-org entry detail stays accessible', r.status === 200, r.status);
+    r = await iso.req('GET', `/api/entries?project_id=${projB}`);
+    check('iso: disabled-org project filter is rejected', r.status === 403, r.status);
+    r = await iso.req('POST', `/api/projects/${projB}/work/claim`, { type: 'translation', limit: 5 });
+    check('iso: disabled-org work claim is 403', r.status === 403, r.status);
+    r = await iso.req('POST', `/api/projects/${projA}/work/claim`, { type: 'translation', limit: 5 });
+    check('iso: enabled-org work claim still works', r.status === 200, r.status);
+    for (const it of r.data.items ?? []) await iso.req('POST', `/api/work/${it.work_item_id}/release`, {});
+    r = await iso.req('GET', `/api/projects/${projB}/stats`);
+    check('iso: disabled-org stats are 403', r.status === 403, r.status);
+    r = await sa.raw('GET', `/api/projects/${projB}/export-bundle`);
+    check('iso: disabled-org export is forbidden even for a superadmin org-admin', r.status === 403, r.status);
+    r = await iso.req('GET', '/api/me');
+    check('iso: platform routes are untouched by app entitlement', r.status === 200);
+
+    // Re-enable B: normal roles resume. Then disable A: isolation flips.
+    await sa.req('PUT', `/api/orgs/${orgB}/apps/language`, { status: 'enabled' });
+    r = await iso.req('GET', `/api/entries/${entryB}`);
+    check('iso: re-enabling Org B restores access', r.status === 200, r.status);
+    await sa.req('PUT', `/api/orgs/${orgA}/apps/language`, { status: 'disabled' });
+    r = await iso.req('GET', `/api/entries/${entryA}`);
+    check('iso: disabling Org A cuts A while B stays accessible',
+      r.status === 403 && (await iso.req('GET', `/api/entries/${entryB}`)).status === 200);
+    await sa.req('PUT', `/api/orgs/${orgA}/apps/language`, { status: 'enabled' });
+
+    // A MISSING organization_apps row means disabled.
+    db.prepare(`DELETE FROM organization_apps WHERE organization_id = ? AND app_code = 'language'`).run(orgB);
+    r = await iso.req('GET', `/api/entries/${entryB}`);
+    check('iso: a missing entitlement row means disabled', r.status === 403, r.status);
+    await sa.req('PUT', `/api/orgs/${orgB}/apps/language`, { status: 'enabled' });
+
+    // cleanup (both orgs enabled again so lifecycle routes work)
+    await sa.req('DELETE', `/api/projects/${projA}`, { confirm_name: `EntIso ProjA ${ts}` });
+    await sa.req('DELETE', `/api/projects/${projB}`, { confirm_name: `EntIso ProjB ${ts}` });
+    await sa.req('DELETE', `/api/orgs/${orgA}`);
+    await sa.req('DELETE', `/api/orgs/${orgB}`);
+    const isoUser = db.prepare('SELECT id FROM users WHERE email = ?').get(isoEmail);
+    r = await sa.req('DELETE', `/api/users/${isoUser.id}`);
+    check('iso: cleanup complete', r.status === 200, JSON.stringify(r.data));
+  } catch (e) {
+    check('entitlement-isolation block ran', false, e.stack || e.message);
+  }
+}
+
 // --- root sign-in page ---
 {
   const anon = client();

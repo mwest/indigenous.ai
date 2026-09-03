@@ -10,6 +10,7 @@ import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, classifyArchive } from './audio.js';
 import { syncEntryTexts, varietyForDialect } from './apps/language/texts.js';
 import { selfSpeakerFor, orgOfProject } from './apps/language/speakers.js';
+import { organizationHasApp, entitledOrgIds } from './platform/entitlements.js';
 import { uuidv7 } from './platform/uid.js';
 import { createRequire } from 'node:module';
 import { backfillEmbeddings } from '../scripts/embed-backfill.js';
@@ -313,11 +314,13 @@ language.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
 platform.use(requireAuth);
 language.use(requireAuth);
 
-// Indigenous.ai application entitlement: an organization must have the
-// 'language' app enabled for its people to use Language routes. Superadmins
-// pass (platform operation — corpus access is still governed by org/project
-// roles); users with no org ties yet pass too (there is nothing to gate, and
-// the routes themselves return empty lists / 403s).
+// COARSE routing gate: "does this user have Language anywhere?" — good enough
+// for routing a user into the app, deliberately NOT the authorization for any
+// resource (two-fixes §1.1). The authoritative check is per-resource below:
+// requireLanguageForOrg() against the org that OWNS the resource, and list
+// endpoints intersect visibility with entitledLanguageOrgs(). Superadmins
+// pass this gate (platform operation — corpus access is still governed by
+// org/project roles); users with no org ties pass too (nothing to gate).
 language.use((req, res, next) => {
   if (req.user.is_superadmin) return next();
   const orgIds = db
@@ -341,6 +344,35 @@ language.use((req, res, next) => {
   if (!enabled) return bad(res, 'The Language application is not enabled for your organization', 403);
   next();
 });
+
+// ---------------------------------------------------------------------------
+// Resource-level entitlement (two-fixes §1): the entitlement belongs to the
+// organization that OWNS the resource being accessed. Every Language resource
+// route resolves its owning org and passes through one of these — an enabled
+// Language app in Org A never authorizes Org B's resources, for anyone
+// (superadmins included: a disabled org's Language data is off, full stop).
+// ---------------------------------------------------------------------------
+
+const LANGUAGE_APP = 'language';
+
+/** True when the owning org has Language enabled; otherwise sends the 403. */
+function requireLanguageForOrg(res, organizationId) {
+  if (organizationHasApp(db, organizationId, LANGUAGE_APP)) return true;
+  bad(res, 'The Language application is not enabled for this organization', 403);
+  return false;
+}
+
+/** Org ids with Language enabled, as a Set — for list/search intersection. */
+function entitledLanguageOrgs() {
+  return new Set(entitledOrgIds(db, LANGUAGE_APP));
+}
+
+/** Projects the user can see AND whose owning org has Language enabled —
+ *  "visible = accessible ∩ entitled" for every list/search surface. */
+function entitledProjectsFor(user) {
+  const entitled = entitledLanguageOrgs();
+  return projectsFor(user).filter((p) => entitled.has(p.organization_id));
+}
 
 // Platform administration: enable/disable an application for an organization.
 platform.put('/orgs/:id/apps/:code', requireSuperadmin, (req, res) => {
@@ -420,6 +452,7 @@ function requireOrgAdminOfProject(req, res, next) {
   if (!project.organization_id || !isOrgAdmin(req.user, project.organization_id)) {
     return bad(res, 'Organization admin access required', 403);
   }
+  if (!requireLanguageForOrg(res, project.organization_id)) return;
   req.project = project;
   next();
 }
@@ -563,6 +596,7 @@ language.get('/orgs/:id/consent-profiles', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
+  if (!requireLanguageForOrg(res, org.id)) return;
   res.json({ profiles: db.prepare('SELECT * FROM consent_profiles WHERE organization_id = ? ORDER BY name').all(org.id) });
 });
 
@@ -570,6 +604,7 @@ language.post('/orgs/:id/consent-profiles', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
   if (!isOrgAdmin(req.user, org.id)) return bad(res, 'Organization admin access required', 403);
+  if (!requireLanguageForOrg(res, org.id)) return;
   const name = String(req.body?.name ?? '').trim();
   if (!name) return bad(res, 'Profile name is required');
   const flags = CONSENT_FLAGS.map((f) => (req.body?.[f] ? 1 : 0));
@@ -590,6 +625,7 @@ function loadConsentProfile(req, res, next) {
   const profile = db.prepare('SELECT * FROM consent_profiles WHERE id = ?').get(req.params.id);
   if (!profile) return bad(res, 'Consent profile not found', 404);
   if (!isOrgAdmin(req.user, profile.organization_id)) return bad(res, 'Organization admin access required', 403);
+  if (!requireLanguageForOrg(res, profile.organization_id)) return;
   req.consentProfile = profile;
   next();
 }
@@ -693,7 +729,9 @@ const projectStats = db.prepare(`
 `);
 
 language.get('/projects', (req, res) => {
-  const projects = projectsFor(req.user).map((p) => ({
+  // Visible = accessible ∩ entitled: projects in Language-disabled orgs are
+  // excluded, for every caller (two-fixes §1.5).
+  const projects = entitledProjectsFor(req.user).map((p) => ({
     ...p,
     ...projectStats.get(p.id, p.id, p.id),
   }));
@@ -716,6 +754,7 @@ language.post('/projects', (req, res) => {
   } else {
     return bad(res, 'You administer multiple organizations — specify organization_id');
   }
+  if (!requireLanguageForOrg(res, orgId)) return;
   // Corpus / campaign separation (plan §10): the corpus is the permanent home
   // of the language data; this project is a campaign of work on it. Pass
   // corpus_id to add a new campaign to an EXISTING corpus (same org);
@@ -815,6 +854,7 @@ function requireProjectAdmin(req, res, next) {
   if (roleIn(req.user, projectId) !== 'admin') {
     return bad(res, 'Project admin access required', 403);
   }
+  if (!requireLanguageForOrg(res, project.organization_id)) return;
   req.project = project;
   next();
 }
@@ -1078,6 +1118,7 @@ language.delete('/requests/:id', requireSuperadmin, (req, res) => {
 language.get('/projects/:id/stats', (req, res) => {
   const projectId = Number(req.params.id);
   if (!roleIn(req.user, projectId)) return bad(res, 'Not a member of this project', 403);
+  if (!requireLanguageForOrg(res, orgOfProject(db, projectId))) return;
   const stats = projectStats.get(projectId, projectId, projectId);
   const recent = db
     .prepare(
@@ -1137,7 +1178,8 @@ const entrySelect = `
 const entryParams = () => [];
 
 language.get('/entries', async (req, res) => {
-  const visible = projectIdsFor(req.user);
+  // Visible = accessible ∩ entitled (two-fixes §1.5).
+  const visible = entitledProjectsFor(req.user).map((p) => p.id);
   if (visible.length === 0) return res.json({ entries: [], total: 0 });
 
   const q = String(req.query.q ?? '').trim();
@@ -1262,6 +1304,7 @@ function loadEntry(req, res, next) {
   if (!entry) return bad(res, 'Entry not found', 404);
   const role = roleIn(req.user, entry.project_id);
   if (!role) return bad(res, 'Not a member of this project', 403);
+  if (!requireLanguageForOrg(res, orgOfProject(db, entry.project_id))) return;
   req.entry = entry;
   req.projectRole = role;
   next();
@@ -1327,6 +1370,7 @@ language.post('/entries', (req, res) => {
   if (role === 'translator') {
     return bad(res, 'Translators add recordings, not entries', 403);
   }
+  if (!requireLanguageForOrg(res, orgOfProject(db, projectId))) return;
   const kind = req.body?.kind === 'phrase' ? 'phrase' : 'word';
   const dene = dene_text?.trim() || '';
   const english = english_text?.trim() || '';
@@ -1609,6 +1653,7 @@ function requireProjectRole(req, res) {
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(Number(req.params.id));
   if (!project) { bad(res, 'Project not found', 404); return null; }
   if (!roleIn(req.user, project.id)) { bad(res, 'Not a member of this project', 403); return null; }
+  if (!requireLanguageForOrg(res, project.organization_id)) return null;
   return project;
 }
 
@@ -1639,6 +1684,7 @@ language.patch('/speakers/:id', (req, res) => {
   const speaker = db.prepare('SELECT * FROM speakers WHERE id = ?').get(req.params.id);
   if (!speaker) return bad(res, 'Speaker not found', 404);
   if (!isOrgAdmin(req.user, speaker.organization_id)) return bad(res, 'Organization admin access required', 403);
+  if (!requireLanguageForOrg(res, speaker.organization_id)) return;
   let userId = speaker.user_id;
   if (req.body?.user_email !== undefined) {
     if (req.body.user_email === null || req.body.user_email === '') userId = null;
@@ -1698,6 +1744,7 @@ language.post('/recording-sessions/:id/end', (req, res) => {
   if (!isFacilitator && roleIn(req.user, session.project_id) !== 'admin') {
     return bad(res, 'Not your recording session', 403);
   }
+  if (!requireLanguageForOrg(res, orgOfProject(db, session.project_id))) return;
   if (!session.ended_at) {
     db.prepare(`UPDATE recording_sessions SET ended_at = datetime('now') WHERE id = ?`).run(session.id);
   }
@@ -1722,6 +1769,7 @@ function loadAudio(req, res, next) {
   const entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(audio.entry_id);
   const role = roleIn(req.user, entry.project_id);
   if (!role) return bad(res, 'Not a member of this project', 403);
+  if (!requireLanguageForOrg(res, orgOfProject(db, entry.project_id))) return;
   req.audio = audio;
   req.audioRole = role;
   next();
@@ -1866,6 +1914,7 @@ function loadWorkItem(req, res, next) {
   if (!item) return bad(res, 'Work item not found', 404);
   const role = roleIn(req.user, item.project_id);
   if (!role) return bad(res, 'Not a member of this project', 403);
+  if (!requireLanguageForOrg(res, orgOfProject(db, item.project_id))) return;
   if (item.assigned_to !== req.user.id && role !== 'admin') {
     return bad(res, 'This work item is not assigned to you', 403);
   }
@@ -1926,6 +1975,7 @@ language.post('/projects/:id/work/claim', (req, res) => {
   const projectId = Number(req.params.id);
   const role = roleIn(req.user, projectId);
   if (!role) return bad(res, 'Not a member of this project', 403);
+  if (!requireLanguageForOrg(res, orgOfProject(db, projectId))) return;
   // A CLOSED campaign takes no new funded work; its corpus stays readable and
   // exportable (plan §10). In-flight claims still submit/release normally.
   const campaign = db.prepare('SELECT status FROM projects WHERE id = ?').get(projectId);
@@ -2170,6 +2220,9 @@ language.post('/entries/:id/audio-rework', (req, res) => {
   const org = db.prepare('SELECT organization_id FROM projects WHERE id = ?').get(entry.project_id);
   if (!org?.organization_id || !isOrgAdmin(req.user, org.organization_id)) {
     return bad(res, 'Organization admin access required', 403);
+  }
+  if (!requireLanguageForOrg(res, org.organization_id)) {
+    return;
   }
   const userId = Number(req.body?.user_id);
   const language = req.body?.language === 'english' ? 'english' : 'dene';
@@ -2708,7 +2761,10 @@ language.get('/me/compensation', (req, res) => {
 // Scoping filters on the PERSISTED organization_id of ledger/payment rows (it
 // survives project deletion). The contributor's own /me view stays global.
 function requireAnyOrgAdmin(req, res, next) {
-  const ids = adminOrgIdsFor(req.user);
+  // Admin compensation views are additionally scoped to orgs with Language
+  // enabled (two-fixes §1.5); a contributor's own /me view stays global.
+  const entitled = entitledLanguageOrgs();
+  const ids = adminOrgIdsFor(req.user).filter((id) => entitled.has(id));
   if (!ids.length) return bad(res, 'Organization admin access required', 403);
   req.adminOrgIds = ids;
   next();
