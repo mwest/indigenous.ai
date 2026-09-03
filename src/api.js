@@ -374,6 +374,44 @@ function entitledProjectsFor(user) {
   return projectsFor(user).filter((p) => entitled.has(p.organization_id));
 }
 
+// ---------------------------------------------------------------------------
+// Corpus ownership (two-fixes #2): the CORPUS owns the permanent language
+// data; a project (campaign) organizes funded work on it. entries.project_id
+// is ORIGIN/PROVENANCE — which campaign created or imported the entry — never
+// ownership (the eventual rename to origin_project_id is deferred, §9 stage
+// 5). Campaign scope is the whole corpus (§3 Option A).
+// ---------------------------------------------------------------------------
+
+/** The organization owning an entry's data: its corpus's org (preferred,
+ *  two-fixes §1.3), falling back to the origin project's for legacy rows. */
+function orgOfEntry(entry) {
+  if (entry.corpus_id) {
+    return db.prepare('SELECT organization_id FROM corpora WHERE id = ?')
+      .get(entry.corpus_id)?.organization_id ?? null;
+  }
+  return orgOfProject(db, entry.project_id);
+}
+
+/** Corpus-based role: the user's strongest role across their projects on the
+ *  entry's corpus — a campaign member works the whole corpus, not only the
+ *  entries their campaign originally created. Legacy corpus-less entries fall
+ *  back to the origin-project role. */
+function roleForEntry(user, entry) {
+  const direct = roleIn(user, entry.project_id);
+  if (direct === 'admin' || !entry.corpus_id) return direct;
+  const rank = { admin: 3, member: 2, translator: 1 };
+  let best = direct;
+  for (const p of projectsFor(user)) {
+    if (p.corpus_id === entry.corpus_id && (rank[p.role] ?? 0) > (rank[best] ?? 0)) best = p.role;
+  }
+  return best;
+}
+
+/** SQL fragment: the entries a campaign operates on — its corpus's entries
+ *  (legacy corpus-less rows fall back to origin). Binds projectId TWICE. */
+const CAMPAIGN_ENTRIES = `(e.corpus_id = (SELECT corpus_id FROM projects WHERE id = ?)
+     OR (e.corpus_id IS NULL AND e.project_id = ?))`;
+
 // Platform administration: enable/disable an application for an organization.
 platform.put('/orgs/:id/apps/:code', requireSuperadmin, (req, res) => {
   const org = db.prepare('SELECT id FROM organizations WHERE id = ?').get(Number(req.params.id));
@@ -676,13 +714,15 @@ language.post('/projects/:id/consent/assign', requireOrgAdminOfProject, (req, re
     return bad(res, 'A consent profile from the project’s organization is required');
   }
   const language = req.body?.language === 'dene' || req.body?.language === 'english' ? req.body.language : null;
+  // Corpus-scoped (two-fixes #2): consent applies to the corpus's recordings,
+  // whichever campaign created them.
   const targets = db
     .prepare(
       `SELECT a.id FROM audio_files a JOIN entries e ON e.id = a.entry_id
-       WHERE e.project_id = ? AND a.consent_profile_name IS NULL AND a.revoked_at IS NULL
+       WHERE ${CAMPAIGN_ENTRIES} AND a.consent_profile_name IS NULL AND a.revoked_at IS NULL
          ${language ? 'AND a.language = ?' : ''}`
     )
-    .all(...(language ? [req.project.id, language] : [req.project.id]));
+    .all(...(language ? [req.project.id, req.project.id, language] : [req.project.id, req.project.id]));
   const stamp = db.prepare(
     `UPDATE audio_files SET consent_profile_name = ?, ${CONSENT_FLAGS.map((f) => `${f} = ?`).join(', ')},
        consent_recorded_at = datetime('now'), consent_method = 'bulk_assign', consent_reference = ?
@@ -719,21 +759,25 @@ function consentSnapshotFor(projectId) {
 // Projects
 // ---------------------------------------------------------------------------
 
+// Stats are CORPUS-scoped (two-fixes #2): a campaign card reports the corpus
+// it operates on, so sibling campaigns on one corpus see the same data pool.
 const projectStats = db.prepare(`
   SELECT
-    (SELECT COUNT(*) FROM entries e WHERE e.project_id = ?) AS entry_count,
+    (SELECT COUNT(*) FROM entries e WHERE ${CAMPAIGN_ENTRIES}) AS entry_count,
     (SELECT COUNT(*) FROM audio_files a JOIN entries e ON e.id = a.entry_id
-      WHERE e.project_id = ? AND a.is_current = 1) AS audio_count,
+      WHERE ${CAMPAIGN_ENTRIES} AND a.is_current = 1) AS audio_count,
     (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a
-      JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ? AND a.is_current = 1) AS audio_seconds
+      JOIN entries e ON e.id = a.entry_id WHERE ${CAMPAIGN_ENTRIES} AND a.is_current = 1) AS audio_seconds
 `);
+const projectStatsFor = (projectId) =>
+  projectStats.get(projectId, projectId, projectId, projectId, projectId, projectId);
 
 language.get('/projects', (req, res) => {
   // Visible = accessible ∩ entitled: projects in Language-disabled orgs are
   // excluded, for every caller (two-fixes §1.5).
   const projects = entitledProjectsFor(req.user).map((p) => ({
     ...p,
-    ...projectStats.get(p.id, p.id, p.id),
+    ...projectStatsFor(p.id),
   }));
   res.json({ projects });
 });
@@ -829,16 +873,21 @@ language.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
     return bad(res, 'Other campaigns share this corpus — close this one instead of deleting it');
   }
 
+  // Sole campaign: destroying it destroys the CORPUS — so the deletion sweeps
+  // the corpus's entries (whatever campaign created them), not just this
+  // project's originals (two-fixes #2).
   const files = db
     .prepare(
       `SELECT a.stored_name, a.playback_stored_name FROM audio_files a
-       JOIN entries e ON e.id = a.entry_id WHERE e.project_id = ?`
+       JOIN entries e ON e.id = a.entry_id WHERE ${CAMPAIGN_ENTRIES}`
     )
-    .all(project.id);
+    .all(project.id, project.id);
   let deletedEntries = 0;
   db.transaction(() => {
     // audio_files rows cascade from entries; memberships cascade from projects
-    deletedEntries = db.prepare('DELETE FROM entries WHERE project_id = ?').run(project.id).changes;
+    deletedEntries = db.prepare(
+      `DELETE FROM entries WHERE id IN (SELECT e.id FROM entries e WHERE ${CAMPAIGN_ENTRIES})`
+    ).run(project.id, project.id).changes;
     db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
     // Sole campaign: the corpus dies with it (checked above).
     if (project.corpus_id) db.prepare('DELETE FROM corpora WHERE id = ?').run(project.corpus_id);
@@ -1119,14 +1168,14 @@ language.get('/projects/:id/stats', (req, res) => {
   const projectId = Number(req.params.id);
   if (!roleIn(req.user, projectId)) return bad(res, 'Not a member of this project', 403);
   if (!requireLanguageForOrg(res, orgOfProject(db, projectId))) return;
-  const stats = projectStats.get(projectId, projectId, projectId);
+  const stats = projectStatsFor(projectId);
   const recent = db
     .prepare(
       `SELECT e.id, e.dene_text, e.english_text, e.updated_at, u.name AS updated_by_name
        FROM entries e JOIN users u ON u.id = e.updated_by
-       WHERE e.project_id = ? ORDER BY e.updated_at DESC, e.id DESC LIMIT 10`
+       WHERE ${CAMPAIGN_ENTRIES} ORDER BY e.updated_at DESC, e.id DESC LIMIT 10`
     )
-    .all(projectId);
+    .all(projectId, projectId);
   // Optional ?kind scopes the contributor list/counts to one entry kind so the
   // Dictionary and Phrases filters each show only their own contributors.
   const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
@@ -1134,9 +1183,9 @@ language.get('/projects/:id/stats', (req, res) => {
     .prepare(
       `SELECT u.id, u.name, COUNT(*) AS entry_count
        FROM entries e JOIN users u ON u.id = e.created_by
-       WHERE e.project_id = ?${kind ? ' AND e.kind = ?' : ''} GROUP BY u.id ORDER BY entry_count DESC`
+       WHERE ${CAMPAIGN_ENTRIES}${kind ? ' AND e.kind = ?' : ''} GROUP BY u.id ORDER BY entry_count DESC`
     )
-    .all(...(kind ? [projectId, kind] : [projectId]));
+    .all(...(kind ? [projectId, projectId, kind] : [projectId, projectId]));
   res.json({ ...stats, recent, contributors });
 });
 
@@ -1178,9 +1227,14 @@ const entrySelect = `
 const entryParams = () => [];
 
 language.get('/entries', async (req, res) => {
-  // Visible = accessible ∩ entitled (two-fixes §1.5).
-  const visible = entitledProjectsFor(req.user).map((p) => p.id);
-  if (visible.length === 0) return res.json({ entries: [], total: 0 });
+  // Visible = accessible ∩ entitled (two-fixes §1.5), and CORPUS-based
+  // (two-fixes #2): entries belong to corpora; a campaign's view is its whole
+  // corpus — including entries created by sibling campaigns. Legacy rows
+  // without a corpus fall back to their origin project.
+  const visibleProjects = entitledProjectsFor(req.user);
+  if (visibleProjects.length === 0) return res.json({ entries: [], total: 0 });
+  const visibleIds = visibleProjects.map((p) => p.id);
+  const visibleCorpora = [...new Set(visibleProjects.map((p) => p.corpus_id).filter(Boolean))];
 
   const q = String(req.query.q ?? '').trim();
   const semantic = !!q && (req.query.semantic === '1' || req.query.semantic === 'yes');
@@ -1189,12 +1243,24 @@ language.get('/entries', async (req, res) => {
 
   const projectId = req.query.project_id ? Number(req.query.project_id) : null;
   if (projectId) {
-    if (!visible.includes(projectId)) return bad(res, 'Not a member of this project', 403);
-    where.push('e.project_id = ?');
-    params.push(projectId);
+    if (!visibleIds.includes(projectId)) return bad(res, 'Not a member of this project', 403);
+    const corpusId = visibleProjects.find((p) => p.id === projectId)?.corpus_id;
+    if (corpusId) {
+      where.push('(e.corpus_id = ? OR (e.corpus_id IS NULL AND e.project_id = ?))');
+      params.push(corpusId, projectId);
+    } else {
+      where.push('e.project_id = ?');
+      params.push(projectId);
+    }
   } else {
-    where.push(`e.project_id IN (${visible.map(() => '?').join(',')})`);
-    params.push(...visible);
+    const scope = [];
+    if (visibleCorpora.length) {
+      scope.push(`e.corpus_id IN (${visibleCorpora.map(() => '?').join(',')})`);
+      params.push(...visibleCorpora);
+    }
+    scope.push(`(e.corpus_id IS NULL AND e.project_id IN (${visibleIds.map(() => '?').join(',')}))`);
+    params.push(...visibleIds);
+    where.push(`(${scope.join(' OR ')})`);
   }
 
   // Keyword (substring) filter — skipped in semantic mode, where every in-scope
@@ -1302,9 +1368,9 @@ function loadEntry(req, res, next) {
     .prepare(`${entrySelect} WHERE e.id = ?`)
     .get(...entryParams(req.user), req.params.id);
   if (!entry) return bad(res, 'Entry not found', 404);
-  const role = roleIn(req.user, entry.project_id);
-  if (!role) return bad(res, 'Not a member of this project', 403);
-  if (!requireLanguageForOrg(res, orgOfProject(db, entry.project_id))) return;
+  const role = roleForEntry(req.user, entry);
+  if (!role) return bad(res, 'Not a member of this corpus', 403);
+  if (!requireLanguageForOrg(res, orgOfEntry(entry))) return;
   req.entry = entry;
   req.projectRole = role;
   next();
@@ -1767,9 +1833,9 @@ function loadAudio(req, res, next) {
   const audio = db.prepare('SELECT * FROM audio_files WHERE id = ?').get(req.params.id);
   if (!audio) return bad(res, 'Audio file not found', 404);
   const entry = db.prepare('SELECT * FROM entries WHERE id = ?').get(audio.entry_id);
-  const role = roleIn(req.user, entry.project_id);
-  if (!role) return bad(res, 'Not a member of this project', 403);
-  if (!requireLanguageForOrg(res, orgOfProject(db, entry.project_id))) return;
+  const role = roleForEntry(req.user, entry);
+  if (!role) return bad(res, 'Not a member of this corpus', 403);
+  if (!requireLanguageForOrg(res, orgOfEntry(entry))) return;
   req.audio = audio;
   req.audioRole = role;
   next();
@@ -2035,19 +2101,23 @@ language.post('/projects/:id/work/claim', (req, res) => {
       ids.push(w.id);
     }
 
+    // Work DISCOVERY is corpus-wide (two-fixes #4): a campaign works on its
+    // corpus's entries, whichever campaign created them. The resulting work
+    // item stays CAMPAIGN-owned (project_id = this campaign) so funding and
+    // compensation attribution are unchanged.
     const remaining = limit - ids.length;
     let candidates = [];
     if (remaining > 0 && type === 'translation') {
       candidates = db
         .prepare(
           `SELECT e.id FROM entries e
-           WHERE e.project_id = ?
+           WHERE ${CAMPAIGN_ENTRIES}
              AND (e.dene_text = '' OR e.english_text = '')
              AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
                                AND w.type = 'translation' AND w.status IN ('claimed', 'submitted'))
            ORDER BY e.updated_at DESC, e.id DESC LIMIT ?`
         )
-        .all(projectId, remaining);
+        .all(projectId, projectId, remaining);
     } else if (remaining > 0) {
       // The accepted-item exclusion enforces "one paid obligation per slot":
       // deleting a billed recording does NOT make the slot claimable again —
@@ -2055,7 +2125,7 @@ language.post('/projects/:id/work/claim', (req, res) => {
       candidates = db
         .prepare(
           `SELECT e.id FROM entries e
-           WHERE e.project_id = ? AND e.dene_text <> '' AND e.english_text <> ''
+           WHERE ${CAMPAIGN_ENTRIES} AND e.dene_text <> '' AND e.english_text <> ''
              AND NOT EXISTS (SELECT 1 FROM audio_files a WHERE a.entry_id = e.id
                                AND a.uploaded_by = ? AND a.language = ? AND a.is_current = 1)
              AND NOT EXISTS (SELECT 1 FROM work_items w WHERE w.entry_id = e.id
@@ -2063,7 +2133,7 @@ language.post('/projects/:id/work/claim', (req, res) => {
                                AND w.status IN ('claimed', 'submitted', 'accepted'))
            ORDER BY e.updated_at DESC, e.id DESC LIMIT ?`
         )
-        .all(projectId, req.user.id, language, language, req.user.id, remaining);
+        .all(projectId, projectId, req.user.id, language, language, req.user.id, remaining);
     }
 
     const ins = db.prepare(
@@ -2263,22 +2333,24 @@ language.get('/projects/:id/export', requireProjectAdmin, (req, res) => {
   const kind = req.query.kind === 'word' || req.query.kind === 'phrase' ? req.query.kind : null;
   const kindSql = kind ? ' AND e.kind = ?' : '';
   const kindArg = kind ? [kind] : [];
+  // Corpus export (two-fixes §7): the corpus's data, whichever campaign
+  // contributed it.
   const rows = db
     .prepare(
       `SELECT e.id, e.uid, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
               cu.name AS contributor, e.created_at, e.updated_at
        FROM entries e JOIN users cu ON cu.id = e.created_by
-       WHERE e.project_id = ?${kindSql} ORDER BY e.id`
+       WHERE ${CAMPAIGN_ENTRIES}${kindSql} ORDER BY e.id`
     )
-    .all(req.project.id, ...kindArg);
+    .all(req.project.id, req.project.id, ...kindArg);
   const audioByEntry = new Map();
   for (const a of db
     .prepare(
       `SELECT a.entry_id, a.stored_name, a.original_name, a.duration_seconds, a.language, a.speaker
        FROM audio_files a JOIN entries e ON e.id = a.entry_id
-       WHERE e.project_id = ? AND a.is_current = 1${kindSql}`
+       WHERE ${CAMPAIGN_ENTRIES} AND a.is_current = 1${kindSql}`
     )
-    .all(req.project.id, ...kindArg)) {
+    .all(req.project.id, req.project.id, ...kindArg)) {
     if (!audioByEntry.has(a.entry_id)) audioByEntry.set(a.entry_id, []);
     audioByEntry.get(a.entry_id).push({
       file: `audio/${a.stored_name}`,
@@ -2360,14 +2432,17 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
   }
   const purposeSql = purpose ? ` AND a.${EXPORT_PURPOSES[purpose]} = 1 AND a.revoked_at IS NULL` : '';
 
+  // CORPUS owner archive (two-fixes §7): the corpus's permanent data,
+  // regardless of which campaign created it. Campaign-specific provenance
+  // (work items, payments) lives in the compensation views, not here.
   const rows = db
     .prepare(
       `SELECT e.id, e.uid, e.kind, e.dene_text, e.english_text, e.source_doc, e.notes, e.category, e.status,
               cu.name AS contributor, e.created_at, e.updated_at
        FROM entries e JOIN users cu ON cu.id = e.created_by
-       WHERE e.project_id = ?${kindSql} ORDER BY e.id`
+       WHERE ${CAMPAIGN_ENTRIES}${kindSql} ORDER BY e.id`
     )
-    .all(req.project.id, ...kindArg);
+    .all(req.project.id, req.project.id, ...kindArg);
   // The OWNER archive (no purpose filter) contains EVERY retained audio version
   // — current and superseded masters alike — with lineage; that's the
   // portability promise (hardening #6). Purpose-filtered dataset exports remain
@@ -2378,10 +2453,10 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
       `SELECT a.*, uu.name AS uploaded_by_name FROM audio_files a
        JOIN entries e ON e.id = a.entry_id
        JOIN users uu ON uu.id = a.uploaded_by
-       WHERE e.project_id = ?${versionSql}${kindSql}${purposeSql}
+       WHERE ${CAMPAIGN_ENTRIES}${versionSql}${kindSql}${purposeSql}
        ORDER BY a.entry_id, a.language, a.id`
     )
-    .all(req.project.id, ...kindArg);
+    .all(req.project.id, req.project.id, ...kindArg);
   // Consent census over ALL current recordings in scope (pre purpose filter),
   // so the manifest states what was excluded and why.
   const census = db
@@ -2392,9 +2467,9 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
          SUM(CASE WHEN a.revoked_at IS NULL AND a.consent_profile_name IS NOT NULL THEN 1 ELSE 0 END) AS consented,
          COUNT(*) AS total
        FROM audio_files a JOIN entries e ON e.id = a.entry_id
-       WHERE e.project_id = ? AND a.is_current = 1${kindSql}`
+       WHERE ${CAMPAIGN_ENTRIES} AND a.is_current = 1${kindSql}`
     )
-    .get(req.project.id, ...kindArg);
+    .get(req.project.id, req.project.id, ...kindArg);
   const orgRow = req.project.organization_id
     ? db.prepare('SELECT id, uid, name, slug FROM organizations WHERE id = ?').get(req.project.organization_id)
     : null;
@@ -2538,7 +2613,7 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
   ].join('\n');
 
   // permissions.json: the consent basis of every included recording plus the
-  // audit trail of assignments/revocations for this project's recordings.
+  // audit trail of assignments/revocations for this corpus's recordings.
   const auditRows = db
     .prepare(
       `SELECT cc.audio_id, cc.action, cc.profile_name, cc.note, u.name AS changed_by, cc.changed_at
@@ -2546,9 +2621,9 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
        JOIN audio_files a ON a.id = cc.audio_id
        JOIN entries e ON e.id = a.entry_id
        JOIN users u ON u.id = cc.changed_by
-       WHERE e.project_id = ? ORDER BY cc.changed_at, cc.id`
+       WHERE ${CAMPAIGN_ENTRIES} ORDER BY cc.changed_at, cc.id`
     )
-    .all(req.project.id);
+    .all(req.project.id, req.project.id);
   const permissionsJson = JSON.stringify({
     purpose_filter: purpose || null,
     flags: CONSENT_FLAGS,

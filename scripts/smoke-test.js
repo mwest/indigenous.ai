@@ -1709,6 +1709,93 @@ if (BASE.includes('localhost')) {
   }
 }
 
+// --- corpus ownership: shared-corpus campaigns (two-fixes #2/#4/§12) ---
+// The corpus owns the entries; campaigns discover and fund work on the whole
+// corpus; provenance and money stay campaign-attributed. Local-only (db
+// provenance assertions + surgical cleanup of the shared corpus pair).
+if (BASE.includes('localhost')) {
+  try {
+    const { default: db } = await import('../src/db.js');
+    const ts = Date.now();
+    r = await sa.req('POST', '/api/projects', { name: `Own A ${ts}`, dialect: 'Dëne Sųłıné' });
+    const projCA = r.data;
+    r = await sa.req('POST', '/api/projects', { name: `Own B ${ts}`, corpus_id: projCA.corpus_id });
+    const projCB = r.data;
+    // Campaign A creates a one-sided entry (translation work for the corpus).
+    r = await sa.req('POST', '/api/entries', { project_id: projCA.id, kind: 'phrase', dene_text: 'ɂerıhtł’é' });
+    const entry1 = r.data.id;
+
+    r = await sa.req('GET', `/api/entries?project_id=${projCB.id}`);
+    check('own: campaign B\'s dictionary shows the corpus entry created by campaign A',
+      r.data.entries.some((e) => e.id === entry1), JSON.stringify(r.data.total));
+    r = await sa.req('GET', `/api/projects/${projCB.id}/stats`);
+    check('own: campaign stats report the corpus, not just own-created entries',
+      r.data.entry_count >= 1, r.data.entry_count);
+
+    // A translator hired by campaign B works on A's entry; the work item and
+    // money belong to B, the entry stays corpus-owned with A as origin.
+    const trEmail = `own-tr-${ts}@test.ca`;
+    await sa.req('POST', `/api/projects/${projCB.id}/members`,
+      { email: trEmail, name: 'Own Translator', password: 'own-tr-pass-1', role: 'translator' });
+    const tr = client();
+    await tr.req('POST', '/api/login', { email: trEmail, password: 'own-tr-pass-1' });
+    r = await tr.req('POST', `/api/projects/${projCB.id}/work/claim`, { type: 'translation', limit: 5 });
+    check('own: campaign B\'s work queue offers campaign A\'s corpus entry',
+      r.data.items.some((i) => i.entry.id === entry1), JSON.stringify(r.data.items?.map((i) => i.entry.id)));
+    const wi = r.data.items.find((i) => i.entry.id === entry1).work_item_id;
+    check('own: the work item belongs to campaign B',
+      db.prepare('SELECT project_id FROM work_items WHERE id = ?').get(wi).project_id === projCB.id);
+    r = await tr.req('POST', `/api/work/${wi}/submit`, { dene_text: 'ɂerıhtł’é', english_text: 'paper' });
+    check('own: translation submits and bills through campaign B', r.status === 200, JSON.stringify(r.data));
+    const ledger = db.prepare('SELECT project_id, organization_id FROM work_log WHERE work_item_id = ?').get(wi);
+    check('own: the ledger row is campaign-B-attributed with the org stamped',
+      ledger?.project_id === projCB.id && !!ledger?.organization_id, JSON.stringify(ledger));
+    const e1 = db.prepare('SELECT project_id, corpus_id FROM entries WHERE id = ?').get(entry1);
+    check('own: the entry stays corpus-owned with campaign A as origin/provenance',
+      e1.corpus_id === projCA.corpus_id && e1.project_id === projCA.id, JSON.stringify(e1));
+
+    // Recording discovery is corpus-wide too.
+    r = await tr.req('POST', `/api/projects/${projCB.id}/work/claim`, { type: 'recording', language: 'dene', limit: 5 });
+    check('own: campaign B\'s recording queue offers the (now complete) corpus entry',
+      r.data.items.some((i) => i.entry.id === entry1));
+    for (const it of r.data.items) await tr.req('POST', `/api/work/${it.work_item_id}/release`, {});
+
+    // Closing campaign A changes nothing for the corpus or campaign B.
+    await sa.req('PATCH', `/api/projects/${projCA.id}`, { status: 'closed' });
+    r = await tr.req('GET', `/api/entries/${entry1}`);
+    check('own: entry stays accessible after its origin campaign closes', r.status === 200, r.status);
+    r = await tr.req('POST', `/api/projects/${projCB.id}/work/claim`, { type: 'recording', language: 'dene', limit: 5 });
+    check('own: campaign B still discovers work after A closes',
+      r.data.items.some((i) => i.entry.id === entry1));
+    for (const it of r.data.items) await tr.req('POST', `/api/work/${it.work_item_id}/release`, {});
+
+    // The corpus owner archive contains A's entry when exported via B.
+    const bundle = (await sa.raw('GET', `/api/projects/${projCB.id}/export-bundle`)).buf.toString('latin1');
+    const e1uid = db.prepare('SELECT uid FROM entries WHERE id = ?').get(entry1).uid;
+    check('own: corpus export via campaign B contains campaign A\'s entry', bundle.includes(e1uid));
+
+    // Integrity: a project cannot adopt a corpus from another organization.
+    r = await sa.req('POST', '/api/orgs', { name: `Own X ${ts}` });
+    const orgX = r.data.id;
+    r = await sa.req('POST', '/api/projects', { name: `Own XProj ${ts}`, organization_id: orgX, corpus_id: projCA.corpus_id });
+    check('own: a project cannot reference a corpus from another organization', r.status === 400, r.status);
+    await sa.req('DELETE', `/api/orgs/${orgX}`);
+
+    // cleanup: retire campaign B surgically, then A (sole) takes the corpus.
+    db.prepare('DELETE FROM projects WHERE id = ?').run(projCB.id);
+    await sa.req('PATCH', `/api/projects/${projCA.id}`, { status: 'active' });
+    r = await sa.req('DELETE', `/api/projects/${projCA.id}`, { confirm_name: `Own A ${ts}` });
+    check('own: sole-campaign delete sweeps the whole corpus', r.status === 200 &&
+      !db.prepare('SELECT 1 FROM entries WHERE id = ?').get(entry1));
+    const trUser = db.prepare('SELECT id FROM users WHERE email = ?').get(trEmail);
+    db.prepare('DELETE FROM work_log WHERE user_id = ?').run(trUser.id);
+    r = await sa.req('DELETE', `/api/users/${trUser.id}`);
+    check('own: cleanup complete', r.status === 200, JSON.stringify(r.data));
+  } catch (e) {
+    check('corpus-ownership block ran', false, e.stack || e.message);
+  }
+}
+
 // --- stable uids (plan §9) ---
 {
   const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
