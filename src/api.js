@@ -906,6 +906,27 @@ language.delete('/projects/:id/members/:userId', requireProjectAdmin, (req, res)
 // User management (superadmin)
 // ---------------------------------------------------------------------------
 
+// Platform provisioning view: every organization (tenant) with rollup counts
+// and its Language entitlement. Superadmin-only — this is service operation,
+// not corpus access; the data inside each org stays invisible.
+platform.get('/admin/orgs', requireSuperadmin, (req, res) => {
+  const orgs = db
+    .prepare(
+      `SELECT o.id, o.uid, o.name, o.slug, o.created_at,
+              (SELECT COUNT(*) FROM organization_memberships om WHERE om.organization_id = o.id) AS member_count,
+              (SELECT COUNT(*) FROM projects p WHERE p.organization_id = o.id) AS project_count,
+              (SELECT COUNT(*) FROM corpora c WHERE c.organization_id = o.id) AS corpus_count,
+              (SELECT group_concat(u.name, ', ')
+                 FROM organization_memberships om JOIN users u ON u.id = om.user_id
+                 WHERE om.organization_id = o.id AND om.role = 'owner_admin') AS owners,
+              COALESCE((SELECT oa.status FROM organization_apps oa
+                 WHERE oa.organization_id = o.id AND oa.app_code = 'language'), 'disabled') AS language_status
+       FROM organizations o ORDER BY o.name`
+    )
+    .all();
+  res.json({ orgs });
+});
+
 platform.get('/users', requireSuperadmin, (req, res) => {
   const users = db
     .prepare(

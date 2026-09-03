@@ -14,7 +14,7 @@ function check(name, cond, detail = '') {
 // the Indigenous.ai platform API and the Language application API. Same rules
 // as the SPA's helper (consent-profiles are Language despite the /orgs prefix).
 const PLATFORM_API =
-  /^\/(login$|logout$|password\/|me$|me\/(password|name)$|orgs$|orgs\/|users$|users\/)/;
+  /^\/(login$|logout$|password\/|me$|me\/(password|name)$|orgs$|orgs\/|users$|users\/|admin\/)/;
 function apiPath(path) {
   if (!path.startsWith('/api/')) return path;
   const rest = path.slice(4);
@@ -1450,6 +1450,12 @@ if (BASE.includes('localhost')) {
   await ent.req('POST', '/api/login', { email: entEmail, password: 'ent-pass-1234' });
   r = await ent.req('GET', '/api/projects');
   check('language routes work while the app is enabled', r.status === 200, r.status);
+  r = await sa.req('GET', '/api/admin/orgs');
+  check('superadmin org roster lists every org with counts and entitlement status',
+    r.status === 200 && r.data.orgs.some((o) => o.id === entOrgId && o.language_status === 'enabled'
+      && o.member_count === 2), JSON.stringify(r.data.orgs?.find?.((o) => o.id === entOrgId)));
+  r = await ent.req('GET', '/api/admin/orgs');
+  check('the org roster is superadmin-only', r.status === 403, r.status);
   r = await sa.req('PUT', `/api/orgs/${entOrgId}/apps/language`, { status: 'disabled' });
   check('superadmin can disable an app for an org', r.status === 200 && r.data.status === 'disabled', JSON.stringify(r.data));
   r = await ent.req('GET', '/api/projects');
