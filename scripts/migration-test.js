@@ -40,10 +40,12 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 5 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied.length === 6 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
     applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids' &&
-    applied[4].name === '005_corpora',
+    applied[4].name === '005_corpora' && applied[5].name === '006_flat_roles',
     JSON.stringify(applied));
+  check('fresh: organization_memberships allows the translator role',
+    tableSql(db, 'organization_memberships').includes('translator'));
   check('fresh: uid unique indexes exist on transferable tables',
     ['organizations', 'projects', 'entries', 'audio_files'].every((t) =>
       db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'idx_${t}_uid'`).get()));
@@ -109,10 +111,13 @@ fs.mkdirSync(legacyDir, { recursive: true });
   `);
   db.prepare(`INSERT INTO users (email, name, password_hash, is_superadmin) VALUES (?,?,?,1)`)
     .run('legacy-admin@test.ca', 'Legacy Admin', 'x');
+  db.prepare(`INSERT INTO users (email, name, password_hash) VALUES (?,?,?)`)
+    .run('legacy-member@test.ca', 'Legacy Member', 'x');
   db.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,1,datetime('now','+1 day'))`)
     .run('raw-legacy-token');
   db.prepare(`INSERT INTO projects (name, dialect) VALUES ('Legacy Project', 'Dëne Sųłıné')`).run();
   db.prepare(`INSERT INTO memberships (user_id, project_id, role) VALUES (1,1,'admin')`).run();
+  db.prepare(`INSERT INTO memberships (user_id, project_id, role) VALUES (2,1,'member')`).run();
   const addEntry = db.prepare(
     `INSERT INTO entries (project_id, dene_text, english_text, created_by, updated_by) VALUES (1,?,?,1,1)`);
   addEntry.run('ʔedlánet’é', 'how are you');
@@ -126,7 +131,15 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
   check('legacy: all migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 5);
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 6);
+  // 006: project roles flatten into org roles — the superadmin's owner grant
+  // (001) is never downgraded; the plain member's project role becomes an org
+  // role; the legacy memberships table survives as provenance.
+  check('legacy: flat roles — owner kept, project member became org member',
+    db.prepare(`SELECT role FROM organization_memberships WHERE user_id = 1`).get()?.role === 'owner_admin' &&
+    db.prepare(`SELECT role FROM organization_memberships WHERE user_id = 2`).get()?.role === 'member');
+  check('legacy: provenance memberships rows preserved',
+    db.prepare(`SELECT COUNT(*) n FROM memberships`).get().n === 2);
   // 005: one permanent corpus per legacy project; data stamped onto it.
   check('legacy: a corpus was created from the project and everything is stamped',
     db.prepare(`SELECT c.name FROM corpora c JOIN projects p ON p.corpus_id = c.id WHERE p.id = 1`)
@@ -139,7 +152,7 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
   check('legacy: backfilled uids are well-formed UUIDv7',
     /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
       .test(db.prepare(`SELECT uid FROM entries WHERE id = 1`).get().uid));
-  check('legacy: users preserved', db.prepare(`SELECT COUNT(*) n FROM users`).get().n === 1);
+  check('legacy: users preserved', db.prepare(`SELECT COUNT(*) n FROM users`).get().n === 2);
   check('legacy: entries preserved with text intact',
     db.prepare(`SELECT COUNT(*) n FROM entries`).get().n === 2 &&
     db.prepare(`SELECT english_text FROM entries WHERE id=1`).get().english_text === 'how are you');

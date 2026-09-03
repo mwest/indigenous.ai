@@ -67,20 +67,25 @@ npm run create-superadmin -- you@example.com "Your Name" "a-strong-password"
 npm start          # http://localhost:3000  (set PORT to change)
 ```
 
-Sign in as the superadmin, create a project from the **Dashboard**, then add members from
-the project card → **Members** (existing accounts are added by email; new accounts need a
-name and temporary password). Organization admins create projects and assign project
-admins; project admins manage their own project's members. There is no public signup.
+Sign in as the superadmin, create a project from the **Dashboard**, then add people on
+the **Organization** page — one list for the whole organization (existing accounts are
+added by email; a new email plus a name creates the account and sends a set-password
+invite). A person's role applies to every project the organization runs. There is no
+public signup.
 
-## Roles
+## Roles (flat model)
+
+One membership list per organization; a role applies to everything the organization
+runs (every campaign/corpus). The legacy per-project `memberships` table is
+historical provenance only.
 
 | Role | Powers |
 |---|---|
-| Superadmin | Platform only: accounts, translation-service requests, provisioning organizations. **No corpus access** without an org/project role |
-| Org owner / org admin | Full authority over their organization's projects: create/edit/delete projects, assign project admins, compensation, exports |
-| Project admin | Manage members, review/verify entries, export, edit any entry — in their project only |
-| Member | Create entries, edit/delete their own entries, upload audio, search within their projects |
-| Translator | Recording and translating through claimed work sessions, plus read-only browsing of the Dictionary and Phrases. Can complete an entry's missing side via the translation session but cannot otherwise create or edit entries |
+| Superadmin | Platform only: accounts, translation-service requests, provisioning organizations and app entitlements. **No corpus access** without an org role |
+| Owner (`owner_admin`) | Everything an admin can, plus managing admins/owners and deleting projects. An org keeps at least one owner |
+| Admin | Manage members and translators, projects, consent profiles, compensation, exports; review/verify and edit any entry |
+| Member | Create entries, edit/delete their own entries, record audio, search — across all of the org's projects |
+| Translator | Paid recording/translation work through claimed sessions, plus read-only browsing. Cannot otherwise create or edit entries |
 
 Translators land on a dashboard with a **Start recording session** button and, whenever
 phrases are awaiting translation, a count and a **Start translations session** button.
