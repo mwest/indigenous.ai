@@ -53,46 +53,35 @@ export function orgsFor(user) {
 }
 
 /**
- * Effective role of a user in a project: 'admin', 'member', 'translator', or null.
- * Org owner_admins/admins are admins of every project their organization owns;
- * otherwise the project membership row decides.
+ * Effective role of a user in a project: 'admin', 'member', 'translator', or
+ * null. FLAT MODEL (006): the org membership is the only membership — a
+ * person's org role applies to every campaign the organization runs
+ * (owner_admin and admin both act as 'admin'; member and translator carry
+ * through). The legacy per-project memberships table is provenance only.
  */
 export function roleIn(user, projectId) {
-  const viaOrg = db
+  const row = db
     .prepare(
-      `SELECT 1 FROM projects p
+      `SELECT om.role FROM projects p
        JOIN organization_memberships om ON om.organization_id = p.organization_id
-       WHERE p.id = ? AND om.user_id = ? AND om.role IN ('owner_admin', 'admin')`
+       WHERE p.id = ? AND om.user_id = ?`
     )
     .get(projectId, user.id);
-  if (viaOrg) return 'admin';
-  const row = db
-    .prepare('SELECT role FROM memberships WHERE user_id = ? AND project_id = ?')
-    .get(user.id, projectId);
-  return row ? row.role : null;
+  if (!row) return null;
+  return row.role === 'owner_admin' || row.role === 'admin' ? 'admin' : row.role;
 }
 
-/** Projects visible to a user, with role. Org-admin authority wins over a plain
- *  project membership when both exist. */
+/** Projects visible to a user, with role: every project of every organization
+ *  the user belongs to (flat model — see roleIn). */
 export function projectsFor(user) {
   return db
     .prepare(
-      `SELECT p.*, MIN(src.rank) AS rank,
-              CASE MIN(src.rank) WHEN 1 THEN 'admin' ELSE MAX(src.role) END AS role
-       FROM (
-         SELECT p2.id AS pid, 1 AS rank, 'admin' AS role
-           FROM projects p2
-           JOIN organization_memberships om ON om.organization_id = p2.organization_id
-          WHERE om.user_id = ? AND om.role IN ('owner_admin', 'admin')
-         UNION ALL
-         SELECT m.project_id AS pid, 2 AS rank, m.role AS role
-           FROM memberships m WHERE m.user_id = ?
-       ) src
-       JOIN projects p ON p.id = src.pid
-       GROUP BY p.id ORDER BY p.name`
+      `SELECT p.*, CASE WHEN om.role IN ('owner_admin', 'admin') THEN 'admin' ELSE om.role END AS role
+       FROM projects p
+       JOIN organization_memberships om ON om.organization_id = p.organization_id
+       WHERE om.user_id = ? ORDER BY p.name`
     )
-    .all(user.id, user.id)
-    .map(({ rank, ...p }) => p);
+    .all(user.id);
 }
 
 /** IDs of projects the user may read. */

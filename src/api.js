@@ -324,14 +324,8 @@ language.use(requireAuth);
 language.use((req, res, next) => {
   if (req.user.is_superadmin) return next();
   const orgIds = db
-    .prepare(
-      `SELECT organization_id AS id FROM organization_memberships WHERE user_id = ?
-       UNION
-       SELECT p.organization_id AS id FROM memberships m
-        JOIN projects p ON p.id = m.project_id
-       WHERE m.user_id = ? AND p.organization_id IS NOT NULL`
-    )
-    .all(req.user.id, req.user.id)
+    .prepare(`SELECT organization_id AS id FROM organization_memberships WHERE user_id = ?`)
+    .all(req.user.id)
     .map((r) => r.id);
   if (!orgIds.length) return next();
   const enabled = db
@@ -555,19 +549,40 @@ platform.get('/orgs/:id/members', (req, res) => {
   res.json({ org: { id: org.id, name: org.name }, members });
 });
 
-// Add or change an org member (existing accounts only — account creation stays a
-// platform/user-management concern). Only owner_admins manage org roles.
-platform.post('/orgs/:id/members', (req, res) => {
+// Add or change an org member. FLAT MODEL (006): the org role is the person's
+// role across every campaign. Owners manage every role; org admins may manage
+// member/translator rows (delegation without owner powers). An unknown email
+// with a name creates the account and sends a set-password invite.
+platform.post('/orgs/:id/members', async (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
-  if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
-  const role = ['owner_admin', 'admin', 'member'].includes(req.body?.role) ? req.body.role : 'member';
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(req.body?.email ?? '').trim());
-  if (!user) return bad(res, 'No account with that email — create the account first');
-  // Never demote the last owner (including an owner demoting themselves).
+  const callerRole = orgRole(req.user, org.id);
+  if (!['owner_admin', 'admin'].includes(callerRole)) {
+    return bad(res, 'Organization admin access required', 403);
+  }
+  const role = ['owner_admin', 'admin', 'member', 'translator'].includes(req.body?.role)
+    ? req.body.role : 'member';
+  let user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(req.body?.email ?? '').trim());
+  let invite = null;
+  if (!user) {
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) return bad(res, 'No account with that email — provide a name to create one');
+    const hash = hashPassword(crypto.randomBytes(32).toString('hex')); // locked until invite used
+    const info = db.prepare('INSERT INTO users (email, name, password_hash) VALUES (?, ?, ?)')
+      .run(String(req.body.email).trim(), name, hash);
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+    invite = await sendInvite(user, req.user.name, org.name);
+  }
   const existing = db
     .prepare('SELECT role FROM organization_memberships WHERE organization_id = ? AND user_id = ?')
     .get(org.id, user.id);
+  // Privileged rows (owner/admin) — assigning to or changing from — are
+  // owner-only; admins handle members and translators.
+  const privileged = ['owner_admin', 'admin'];
+  if ((privileged.includes(role) || privileged.includes(existing?.role)) && callerRole !== 'owner_admin') {
+    return bad(res, 'Organization owner access required for admin and owner roles', 403);
+  }
+  // Never demote the last owner (including an owner demoting themselves).
   if (existing?.role === 'owner_admin' && role !== 'owner_admin') {
     const owners = db
       .prepare(`SELECT COUNT(*) AS n FROM organization_memberships WHERE organization_id = ? AND role = 'owner_admin'`)
@@ -578,7 +593,7 @@ platform.post('/orgs/:id/members', (req, res) => {
     `INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)
      ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role`
   ).run(org.id, user.id, role);
-  res.status(201).json({ ok: true, user_id: user.id, role });
+  res.status(201).json({ ok: true, user_id: user.id, role, ...(invite ?? {}) });
 });
 
 // Delete an EMPTY organization (owns no projects). Owner-only; memberships and
@@ -603,11 +618,17 @@ platform.delete('/orgs/:id', (req, res) => {
 platform.delete('/orgs/:id/members/:userId', (req, res) => {
   const org = db.prepare('SELECT * FROM organizations WHERE id = ?').get(req.params.id);
   if (!org) return bad(res, 'Organization not found', 404);
-  if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
+  const callerRole = orgRole(req.user, org.id);
+  if (!['owner_admin', 'admin'].includes(callerRole)) {
+    return bad(res, 'Organization admin access required', 403);
+  }
   const target = db
     .prepare('SELECT * FROM organization_memberships WHERE organization_id = ? AND user_id = ?')
     .get(org.id, req.params.userId);
   if (!target) return bad(res, 'Not a member of this organization', 404);
+  if (['owner_admin', 'admin'].includes(target.role) && callerRole !== 'owner_admin') {
+    return bad(res, 'Organization owner access required to remove admins or owners', 403);
+  }
   if (target.role === 'owner_admin') {
     const owners = db
       .prepare(`SELECT COUNT(*) AS n FROM organization_memberships WHERE organization_id = ? AND role = 'owner_admin'`)
@@ -909,30 +930,41 @@ function requireProjectAdmin(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// Membership management
+// Membership management — FLAT MODEL (006): organization membership is the
+// only membership, and a role applies to every campaign in the org. These
+// project-scoped routes remain as ALIASES that operate on the org membership
+// (the Organization page is the canonical UI); the legacy per-project
+// memberships table is provenance only and no longer written.
 // ---------------------------------------------------------------------------
+
+const ORG_ROLE_RANK = { owner_admin: 4, admin: 3, member: 2, translator: 1 };
 
 language.get('/projects/:id/members', requireProjectAdmin, (req, res) => {
   const members = db
     .prepare(
-      `SELECT u.id, u.email, u.name, m.role, m.created_at,
-              (SELECT COUNT(*) FROM entries e WHERE e.project_id = m.project_id AND e.created_by = u.id) AS entry_count
-       FROM memberships m JOIN users u ON u.id = m.user_id
-       WHERE m.project_id = ?
-       ORDER BY m.role, u.name`
+      `SELECT u.id, u.email, u.name,
+              CASE WHEN om.role IN ('owner_admin', 'admin') THEN 'admin' ELSE om.role END AS role,
+              om.created_at,
+              (SELECT COUNT(*) FROM entries e WHERE e.corpus_id = (SELECT corpus_id FROM projects WHERE id = ?)
+                 AND e.created_by = u.id) AS entry_count
+       FROM organization_memberships om JOIN users u ON u.id = om.user_id
+       WHERE om.organization_id = ?
+       ORDER BY om.role, u.name`
     )
-    .all(req.project.id);
+    .all(req.project.id, req.project.organization_id);
   res.json({ members });
 });
 
-// Add a member: existing user by email, or create a new account. With no
-// password, the new account gets an invite email with a set-password link.
+// Add a person: existing user by email, or create a new account (no password
+// -> invite email with a set-password link). Grants an ORG role, which
+// applies across every campaign in the organization.
 language.post('/projects/:id/members', requireProjectAdmin, async (req, res) => {
   const { email, name, password, role } = req.body ?? {};
   if (!email || !String(email).trim()) return bad(res, 'Email is required');
   const memberRole = ['admin', 'translator'].includes(role) ? role : 'member';
-  if (memberRole === 'admin' && !isOrgAdmin(req.user, req.project.organization_id)) {
-    return bad(res, 'Only an organization admin can assign project admins', 403);
+  const orgId = req.project.organization_id;
+  if (memberRole === 'admin' && orgRole(req.user, orgId) !== 'owner_admin') {
+    return bad(res, 'Only the organization owner can assign admins', 403);
   }
 
   let user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email).trim());
@@ -956,38 +988,38 @@ language.post('/projects/:id/members', requireProjectAdmin, async (req, res) => 
   }
 
   const existing = db
-    .prepare('SELECT role FROM memberships WHERE user_id = ? AND project_id = ?')
-    .get(user.id, req.project.id);
+    .prepare('SELECT role FROM organization_memberships WHERE user_id = ? AND organization_id = ?')
+    .get(user.id, orgId);
   if (existing) {
-    if (existing.role === memberRole) return bad(res, 'Already a member of this project');
-    if ((existing.role === 'admin' || memberRole === 'admin') && !isOrgAdmin(req.user, req.project.organization_id)) {
-      return bad(res, 'Only an organization admin can change admin roles', 403);
+    if (existing.role === 'owner_admin') return bad(res, 'Already the organization owner');
+    if (existing.role === memberRole) return bad(res, 'Already has this role in the organization');
+    if (existing.role === 'admin' && orgRole(req.user, orgId) !== 'owner_admin') {
+      return bad(res, 'Only the organization owner can change an admin’s role', 403);
     }
-    db.prepare('UPDATE memberships SET role = ? WHERE user_id = ? AND project_id = ?').run(
-      memberRole, user.id, req.project.id
-    );
+    db.prepare('UPDATE organization_memberships SET role = ? WHERE user_id = ? AND organization_id = ?')
+      .run(memberRole, user.id, orgId);
   } else {
-    db.prepare('INSERT INTO memberships (user_id, project_id, role) VALUES (?, ?, ?)').run(
-      user.id, req.project.id, memberRole
-    );
+    db.prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
+      .run(orgId, user.id, memberRole);
   }
   res.status(201).json({ ok: true, user_id: user.id, ...(invite ?? {}) });
 });
 
 language.delete('/projects/:id/members/:userId', requireProjectAdmin, (req, res) => {
+  const orgId = req.project.organization_id;
   const membership = db
-    .prepare('SELECT * FROM memberships WHERE user_id = ? AND project_id = ?')
-    .get(req.params.userId, req.project.id);
-  if (!membership) return bad(res, 'Not a member of this project', 404);
-  if (membership.role === 'admin' && !isOrgAdmin(req.user, req.project.organization_id)) {
-    return bad(res, 'Only an organization admin can remove a project admin', 403);
+    .prepare('SELECT * FROM organization_memberships WHERE user_id = ? AND organization_id = ?')
+    .get(req.params.userId, orgId);
+  if (!membership) return bad(res, 'Not a member of this organization', 404);
+  if (membership.role === 'owner_admin') return bad(res, 'The organization owner is removed from the Organization page', 403);
+  if (membership.role === 'admin' && orgRole(req.user, orgId) !== 'owner_admin') {
+    return bad(res, 'Only the organization owner can remove an admin', 403);
   }
   // Membership is removed; sessions stay valid but every request re-checks
-  // membership, so access to this project's data ends immediately. Past
+  // membership, so access to the organization's data ends immediately. Past
   // contributions keep their created_by attribution.
-  db.prepare('DELETE FROM memberships WHERE user_id = ? AND project_id = ?').run(
-    req.params.userId, req.project.id
-  );
+  db.prepare('DELETE FROM organization_memberships WHERE user_id = ? AND organization_id = ?')
+    .run(req.params.userId, orgId);
   res.json({ ok: true });
 });
 
@@ -1022,12 +1054,13 @@ platform.get('/users', requireSuperadmin, (req, res) => {
       `SELECT u.id, u.email, u.name, u.is_superadmin, u.created_at,
               (SELECT COUNT(*) FROM entries e WHERE e.created_by = u.id) AS entry_count,
               (SELECT COUNT(*) FROM audio_files a WHERE a.uploaded_by = u.id AND a.is_current = 1) AS audio_count,
-              (SELECT group_concat(p.name || ' (' ||
-                        CASE m.role WHEN 'admin' THEN 'Project admin'
-                                    WHEN 'translator' THEN 'Translator'
-                                    ELSE 'Member' END || ')', ', ')
-                 FROM memberships m JOIN projects p ON p.id = m.project_id
-                 WHERE m.user_id = u.id) AS memberships
+              (SELECT group_concat(o.name || ' (' ||
+                        CASE om.role WHEN 'owner_admin' THEN 'Owner'
+                                     WHEN 'admin' THEN 'Admin'
+                                     WHEN 'translator' THEN 'Translator'
+                                     ELSE 'Member' END || ')', ', ')
+                 FROM organization_memberships om JOIN organizations o ON o.id = om.organization_id
+                 WHERE om.user_id = u.id) AS memberships
        FROM users u ORDER BY u.is_superadmin DESC, u.name`
     )
     .all();
@@ -2854,8 +2887,8 @@ function userInAdminOrgs(req, userId) {
   return !!db
     .prepare(
       `SELECT 1 WHERE EXISTS (
-         SELECT 1 FROM memberships m JOIN projects p ON p.id = m.project_id
-         WHERE m.user_id = ? AND p.organization_id IN (${ph}))
+         SELECT 1 FROM organization_memberships om
+         WHERE om.user_id = ? AND om.organization_id IN (${ph}))
        OR EXISTS (SELECT 1 FROM work_log w WHERE w.user_id = ? AND w.organization_id IN (${ph}))
        OR EXISTS (SELECT 1 FROM payments py WHERE py.user_id = ? AND py.organization_id IN (${ph}))`
     )
@@ -2905,8 +2938,8 @@ language.get('/compensation', requireAnyOrgAdmin, (req, res) => {
   const people = db
     .prepare(
       `SELECT u.id, u.name, u.email FROM users u
-       WHERE u.id IN (SELECT m.user_id FROM memberships m JOIN projects p ON p.id = m.project_id
-                       WHERE m.role = 'translator' AND p.organization_id IN (${ph}))
+       WHERE u.id IN (SELECT om.user_id FROM organization_memberships om
+                       WHERE om.role = 'translator' AND om.organization_id IN (${ph}))
           OR u.id IN (SELECT w.user_id FROM work_log w WHERE w.organization_id IN (${ph}))
           OR u.id IN (SELECT py.user_id FROM payments py WHERE py.organization_id IN (${ph}))
        ORDER BY u.name`
@@ -2929,12 +2962,13 @@ language.get('/compensation/:userId', requireAnyOrgAdmin, (req, res) => {
     .all(user.id, ...req.adminOrgIds);
   const work = workLogScoped(user.id, req.adminOrgIds);
   const payments = paymentsScoped(user.id, req.adminOrgIds);
-  // Projects the person belongs to WITHIN the caller's orgs — the set rates
-  // can be managed for.
+  // Campaigns rates can be managed for: every project of the caller's orgs
+  // that the person belongs to (flat model: org membership covers them all).
   const projects = db
     .prepare(
-      `SELECT p.id, p.name FROM projects p JOIN memberships m ON m.project_id = p.id
-       WHERE m.user_id = ? AND p.organization_id IN (${ph}) ORDER BY p.name`
+      `SELECT p.id, p.name FROM projects p
+       JOIN organization_memberships om ON om.organization_id = p.organization_id AND om.user_id = ?
+       WHERE p.organization_id IN (${ph}) ORDER BY p.name`
     )
     .all(user.id, ...req.adminOrgIds);
   res.json({ user, ...totalsScoped(user.id, req.adminOrgIds), rates, work, payments, projects });

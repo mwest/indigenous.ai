@@ -343,7 +343,7 @@ function renderTopbar() {
   $('#nav-orgs').hidden = !state.me.user.is_superadmin;
   $('#nav-jobs').hidden = !state.me.user.is_superadmin;
   $('#nav-compensation').hidden = !isOrgAdmin();
-  $('#nav-org').hidden = !isOrgOwner();
+  $('#nav-org').hidden = !isOrgAdmin();
   // Translators browse the Dictionary and Phrases too (read-only; the server
   // blocks them from creating/editing entries).
 
@@ -489,7 +489,7 @@ function renderLogin() {
             <a href="#/forgot" style="font-size:0.9rem">Forgot your password?</a></p>
         </form>
       </div>
-      <p class="login-note">Accounts are created by your project admin.</p>
+      <p class="login-note">Accounts are created by your organization’s administrator.</p>
     </div>`;
   $('#login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -547,7 +547,7 @@ function renderSetPassword(token) {
     try { info = await api('/password/token/' + token); }
     catch (err) {
       $('#setpw-card').innerHTML = `<p>${esc(err.message)}</p>
-        <p>Ask your project admin for a new invite, or
+        <p>Ask your administrator for a new invite, or
         <a href="#/forgot">request a fresh reset link</a>.</p>`;
       return;
     }
@@ -1004,7 +1004,7 @@ async function renderEntries(kind = 'word') {
   const projects = state.me.projects;
   if (!projects.length) {
     view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
-      Ask your project admin to add you.</div>`;
+      Ask your organization’s administrator to add you.</div>`;
     return;
   }
   const ap = activeProject();
@@ -1604,7 +1604,7 @@ async function renderTranslatorDashboard() {
   const p = activeProject();
   if (!p) {
     view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
-      Ask your project admin to add you.</div>`;
+      Ask your organization’s administrator to add you.</div>`;
     return;
   }
   view.innerHTML = `<div class="empty">Loading…</div>`;
@@ -2137,7 +2137,6 @@ async function renderDashboard() {
     const pid = btn.dataset.id;
     const action = btn.dataset.projAction;
     if (action === 'activity') await showProjectActivity(pid);
-    if (action === 'members') location.hash = `#/projects/${pid}/members`;
     if (action === 'edit') showEditProjectModal(pid);
     if (action === 'import') showImportModal(pid, btn.dataset.name);
     if (action === 'consent') showConsentModal(pid);
@@ -2325,7 +2324,6 @@ function projectCardHtml(p) {
       <div class="card-actions">
         <button class="ghost small" data-proj-action="activity" data-id="${p.id}">Recent activity</button>
         ${admin ? `
-          <button class="ghost small" data-proj-action="members" data-id="${p.id}">Members</button>
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/language/projects/${p.id}/export?format=csv">Export CSV</a>
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/language/projects/${p.id}/export?format=json">Export JSON</a>
           <a class="btn secondary small" style="padding:0.25rem 0.6rem;font-size:0.85rem" href="/api/language/projects/${p.id}/export-bundle" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
@@ -2399,101 +2397,7 @@ function showNewProjectModal() {
 }
 
 // ---------------------------------------------------------------------------
-// Members view (project admins)
 // ---------------------------------------------------------------------------
-
-async function renderMembers(projectId) {
-  setActiveNav('dashboard');
-  view.innerHTML = `<div class="empty">Loading…</div>`;
-  let data;
-  try { data = await api(`/projects/${projectId}/members`); }
-  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
-
-  const project = state.me.projects.find((p) => p.id === Number(projectId));
-  const isSuper = isOrgAdmin(); // only org admins assign/remove project admins
-
-  view.innerHTML = `
-    <div class="page-head">
-      <h1>${esc(project?.name ?? 'Project')} — members</h1>
-      <a class="btn secondary" href="#/dashboard">‹ Back to dashboard</a>
-    </div>
-    <div class="card">
-      <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Entries</th><th>Added</th><th></th></tr></thead>
-        <tbody>
-          ${data.members.map((mb) => `
-            <tr>
-              <td>${esc(mb.name)}</td>
-              <td>${esc(mb.email)}</td>
-              <td><span class="badge">${{ admin: 'Project admin', translator: 'Translator' }[mb.role] ?? 'Member'}</span></td>
-              <td>${mb.entry_count}</td>
-              <td>${fmtDate(mb.created_at)}</td>
-              <td>${mb.role === 'admin' && !isSuper ? '' :
-                `<button class="danger small" data-remove="${mb.id}">Remove</button>`}</td>
-            </tr>`).join('') || '<tr><td colspan="6" style="color:var(--muted)">No members yet.</td></tr>'}
-        </tbody>
-      </table></div>
-    </div>
-    <div class="card">
-      <h2 style="margin-top:0">Add a member</h2>
-      <p style="color:var(--muted);font-size:0.9rem;margin-top:-0.5rem">
-        If the email already has an account, it will simply be added to this project.
-        Otherwise fill in a name — they’ll get an invite email with a link to set
-        their own password (or set a temporary password here instead).</p>
-      <form id="add-member-form">
-        <div class="form-row">
-          <label class="field"><span>Email</span>
-            <input type="email" name="email" required></label>
-          <label class="field"><span>Name (for new accounts)</span>
-            <input type="text" name="name"></label>
-          <label class="field"><span>Temporary password (optional)</span>
-            <input type="text" name="password" minlength="8" autocomplete="off"
-              placeholder="blank = email an invite"></label>
-          <label class="field"><span>Role</span>
-            <select name="role">
-              <option value="member">Member</option>
-              <option value="translator">Translator</option>
-              ${isSuper ? '<option value="admin">Project admin</option>' : ''}
-            </select></label>
-        </div>
-        <p class="error-msg" hidden></p>
-        <button type="submit">Add member</button>
-      </form>
-    </div>`;
-
-  $('#add-member-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    try {
-      const r = await api(`/projects/${projectId}/members`, {
-        method: 'POST',
-        body: {
-          email: f.email.value,
-          name: f.name.value || undefined,
-          password: f.password.value || undefined,
-          role: f.role?.value || 'member',
-        },
-      });
-      if (r.invite_link && !r.invite_sent) {
-        prompt('Member added, but the invite email could not be sent.\nCopy this set-password link and share it with them:', r.invite_link);
-      } else {
-        toast(r.invite_sent ? 'Member added — invite email sent' : 'Member added');
-      }
-      renderMembers(projectId);
-    } catch (err) { showFormError(f, err.message); }
-  });
-
-  view.onclick = async (e) => {
-    const btn = e.target.closest('button[data-remove]');
-    if (!btn) return;
-    if (!confirm('Remove this member from the project? Their past entries stay attributed to them, but they lose access immediately.')) return;
-    try {
-      await api(`/projects/${projectId}/members/${btn.dataset.remove}`, { method: 'DELETE' });
-      toast('Member removed');
-      renderMembers(projectId);
-    } catch (err) { toast(err.message, true); }
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Organizations view (superadmin) — platform provisioning: create tenants,
@@ -2649,8 +2553,9 @@ async function renderUsers() {
       </table></div>
       <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0">
         Accounts with contributions can't be deleted (attribution is preserved) — remove them
-        from their projects instead, which revokes all access. Project membership is managed
-        from each project's <a href="#/dashboard">Dashboard</a> card.</p>
+        from their organization instead, which revokes all access. Membership is managed
+        on the <a href="#/org">Organization</a> page: one list, and a role applies to every
+        project the organization runs.</p>
     </div>`;
 
   $('#new-user-btn').addEventListener('click', () => {
@@ -2730,7 +2635,9 @@ async function renderUsers() {
 async function renderOrganization() {
   setActiveNav('org');
   view.innerHTML = `<div class="empty">Loading…</div>`;
-  const owned = (state.me.orgs ?? []).filter((o) => o.role === 'owner_admin');
+  // Owners AND org admins manage people here (flat model): admins handle
+  // members/translators; owner-only actions are gated per-org below.
+  const owned = (state.me.orgs ?? []).filter((o) => o.role === 'owner_admin' || o.role === 'admin');
   if (!owned.length) { location.hash = '#/dashboard'; return; }
 
   const sections = [];
@@ -2755,12 +2662,14 @@ async function renderOrganization() {
     allow_translation_model_training: 'Translation AI', allow_research: 'Research',
     allow_commercial_use: 'Commercial', allow_redistribution: 'Redistribution',
   };
-  const roleLabel = { owner_admin: 'Owner', admin: 'Org admin', member: 'Member' };
+  const roleLabel = { owner_admin: 'Owner', admin: 'Admin', member: 'Member', translator: 'Translator' };
   view.innerHTML = `
     <div class="page-head"><h1>Organization</h1></div>
-    <p style="color:var(--muted);max-width:60ch">Organization roles govern the corpus:
-      owners and org admins control projects, project admins, compensation, and exports.
-      Platform administration (accounts, service) is separate and grants no access here.</p>
+    <p style="color:var(--muted);max-width:60ch">One list, four roles — a person's role
+      applies to everything the organization runs. <b>Owners</b> and <b>admins</b> manage
+      people, projects, consent, compensation, and exports; <b>members</b> build the
+      corpus; <b>translators</b> work paid recording/translation sessions. Platform
+      administration (accounts, service) is separate and grants no access here.</p>
     ${sections.map(({ org, members, error }) => `
       <div class="card">
         <h2 style="margin-top:0">${esc(org.name)}</h2>
@@ -2779,11 +2688,14 @@ async function renderOrganization() {
           </tbody>
         </table></div>
         <form class="org-add" data-org="${org.id}" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.8rem">
-          <input type="email" name="email" required placeholder="email of an existing account" style="flex:1;min-width:220px">
+          <input type="email" name="email" required placeholder="email" style="flex:1;min-width:200px">
+          <input type="text" name="name" placeholder="name (new accounts get an invite email)" style="flex:1;min-width:220px">
           <select name="role">
             <option value="member">Member</option>
-            <option value="admin">Org admin</option>
-            <option value="owner_admin">Owner</option>
+            <option value="translator">Translator</option>
+            ${org.role === 'owner_admin' ? `
+            <option value="admin">Admin</option>
+            <option value="owner_admin">Owner</option>` : ''}
           </select>
           <button type="submit">Add / set role</button>
         </form>
@@ -2809,7 +2721,7 @@ async function renderOrganization() {
   view.onclick = async (e) => {
     const rm = e.target.closest('button[data-org-remove]');
     if (rm) {
-      if (!confirm('Remove this person from the organization? Their project memberships are unaffected.')) return;
+      if (!confirm('Remove this person from the organization? Their access to all of its projects ends immediately; past contributions keep their attribution.')) return;
       try {
         await api(`/orgs/${rm.dataset.orgRemove}/members/${rm.dataset.user}`, { method: 'DELETE' });
         toast('Removed from organization');
@@ -2831,11 +2743,15 @@ async function renderOrganization() {
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
       try {
-        await api(`/orgs/${f.dataset.org}/members`, {
+        const r = await api(`/orgs/${f.dataset.org}/members`, {
           method: 'POST',
-          body: { email: f.email.value.trim(), role: f.role.value },
+          body: { email: f.email.value.trim(), name: f.name.value.trim() || undefined, role: f.role.value },
         });
-        toast('Organization role saved');
+        if (r.invite_link && !r.invite_sent) {
+          prompt('Added, but the invite email could not be sent.\nCopy this set-password link and share it with them:', r.invite_link);
+        } else {
+          toast(r.invite_sent ? 'Added — invite email sent' : 'Organization role saved');
+        }
         renderOrganization();
       } catch (err) { toast(err.message, true); }
     });
@@ -2908,8 +2824,7 @@ function route() {
   else if ((m = hash.match(/^#\/jobs\/(\d+)$/)) && state.me.user.is_superadmin) renderJobDetail(m[1]);
   else if (hash === '#/compensation' && isOrgAdmin()) renderCompensation();
   else if ((m = hash.match(/^#\/compensation\/(\d+)$/)) && isOrgAdmin()) renderCompensationDetail(m[1]);
-  else if (hash === '#/org' && isOrgOwner()) renderOrganization();
-  else if ((m = hash.match(/^#\/projects\/(\d+)\/members$/))) renderMembers(m[1]);
+  else if (hash === '#/org' && isOrgAdmin()) renderOrganization();
   else { location.hash = '#/entries'; }
 }
 

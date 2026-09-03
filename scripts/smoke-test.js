@@ -97,7 +97,15 @@ r = await sa.req('GET', '/api/me');
 if ((r.data.orgs ?? []).length === 0) {
   r = await sa.req('POST', '/api/orgs', { name: 'Dene Voice Project' });
   check('fresh install: superadmin provisions the first organization', r.status === 201, JSON.stringify(r.data));
+  r = await sa.req('GET', '/api/me');
 }
+// Snapshot the main org's roster: the flat model means people added during
+// the run stay org members, so the end-of-suite cleanup removes exactly the
+// members this run introduced.
+const mainOrgId = r.data.orgs[0].id;
+const preexistingMembers = new Set(
+  ((await sa.req('GET', `/api/orgs/${mainOrgId}/members`)).data.members ?? []).map((mb) => mb.id)
+);
 
 // --- projects ---
 const pname = `Smoke Test ${Date.now()}`;
@@ -120,8 +128,11 @@ r = await member.req('POST', '/api/login', { email: memberEmail, password: 'memb
 check('member login', r.status === 200);
 
 r = await member.req('GET', '/api/projects');
-check('member sees only their project', r.status === 200 &&
-  r.data.projects.length === 1 && r.data.projects[0].id === projectId, JSON.stringify(r.data));
+// FLAT MODEL: an org member sees every project the organization runs.
+check('member sees their org’s projects (flat model)', r.status === 200 &&
+  r.data.projects.some((p) => p.id === projectId) &&
+  r.data.projects.every((p) => p.organization_id === r.data.projects[0].organization_id),
+  r.status);
 
 r = await member.req('POST', '/api/projects', { name: 'Should fail' });
 check('member cannot create projects', r.status === 403);
@@ -138,8 +149,9 @@ const strangerEmail = `stranger${Date.now()}@test.ca`;
 // create a second project + user to test isolation
 r = await sa.req('POST', '/api/projects', { name: pname + ' B' });
 const projectB = r.data.id;
-await sa.req('POST', `/api/projects/${projectB}/members`,
+r = await sa.req('POST', `/api/projects/${projectB}/members`,
   { email: strangerEmail, name: 'Stranger', password: 'stranger-pass-1' });
+const strangerId = r.data.user_id;
 await stranger.req('POST', '/api/login', { email: strangerEmail, password: 'stranger-pass-1' });
 
 // --- entries ---
@@ -154,12 +166,16 @@ check('member creates entry with Dene diacritics', r.status === 201, JSON.string
 const entryId = r.data?.id;
 check('entry preserves Unicode text', r.data?.dene_text === 'Sı̨ Mike sʔǫlye, ʔedlánet\'e?');
 
+// FLAT MODEL: the "stranger" holds a role in the same ORGANIZATION (via
+// project B), so the whole org's corpora are theirs to read and build.
+// True isolation is cross-organization — covered by the entitlement block.
 r = await stranger.req('GET', `/api/entries/${entryId}`);
-check('non-member cannot read entry (project isolation)', r.status === 403);
+check('an org member can read any org project entry (flat model)', r.status === 200, r.status);
 
 r = await stranger.req('POST', '/api/entries',
   { project_id: projectId, dene_text: 'x', english_text: 'y' });
-check('non-member cannot create entry in project', r.status === 403);
+check('an org member can contribute to any org project (flat model)', r.status === 201, r.status);
+await stranger.req('DELETE', `/api/entries/${r.data.id}`); // keep downstream counts stable
 
 r = await member.req('PATCH', `/api/entries/${entryId}`, { english_text: 'My name is Mike. How are you?' });
 check('member edits own entry', r.status === 200 && r.data.english_text.includes('How are you?'));
@@ -191,10 +207,10 @@ r = await member.req('GET', '/api/entries?q=zzz-no-match-zzz');
 check('search with no results', r.status === 200 && r.data.total === 0);
 
 r = await stranger.req('GET', '/api/entries?q=Mike');
-check('search excludes other projects', r.status === 200 && r.data.total === 0, JSON.stringify(r.data));
+check('org-wide search reaches sibling projects (flat model)', r.status === 200 && r.data.total >= 1, JSON.stringify(r.data.total));
 
 r = await member.req('GET', `/api/entries?project_id=${projectB}`);
-check('filtering by non-member project rejected', r.status === 403);
+check('org members may filter by any org project (flat model)', r.status === 200, r.status);
 
 // --- audio ---
 const wav = makeWav(2);
@@ -230,7 +246,7 @@ r = await member.req('GET', `/api/audio/${audioId}/stream`);
 check('member streams audio', r.status === 200);
 
 r = await stranger.req('GET', `/api/audio/${audioId}/stream`);
-check('non-member cannot stream audio', r.status === 403);
+check('org members can stream any org recording (flat model)', r.status === 200, r.status);
 
 // Re-record: a same-language upload creates a NEW version and supersedes the old
 // one (the old master is preserved, not destroyed) — #8b.
@@ -262,6 +278,7 @@ check('member has one dene + one english', r.status === 200 && r.data.audio.leng
 const member2Email = `member2-${Date.now()}@test.ca`;
 await sa.req('POST', `/api/projects/${projectId}/members`,
   { email: member2Email, name: 'Second Member', password: 'member2-pass-1' });
+const member2Id = r.data.user_id;
 const member2 = client();
 await member2.req('POST', '/api/login', { email: member2Email, password: 'member2-pass-1' });
 
@@ -1070,8 +1087,13 @@ r = await sa.req('DELETE', `/api/projects/${projectB}`, { confirm_name: pname + 
 check('second project deleted', r.status === 200);
 
 r = await stranger.req('GET', '/api/projects');
-check('membership gone after project deletion', r.status === 200 && r.data.projects.length === 0,
-  JSON.stringify(r.data));
+// FLAT MODEL: the org membership survives project deletion — only the deleted
+// projects disappear from the list.
+check('deleted projects gone from the list (flat model)', r.status === 200 &&
+  !r.data.projects.some((p) => p.id === projectId || p.id === projectB),
+  JSON.stringify(r.data.projects?.map?.((p) => p.id)));
+
+
 
 // --- organizations & platform/data separation (#5) ---
 // (Placed last: creating a second org makes sa multi-org, so earlier
@@ -1131,11 +1153,17 @@ r = await oa.req('POST', '/api/projects', { name: orgProjName });
 check('org admin creates a project (sole-org default)', r.status === 201, JSON.stringify(r.data));
 const orgProjId = r.data?.id;
 check('project belongs to the org', r.data?.organization_id === orgId, JSON.stringify(r.data?.organization_id));
+// FLAT MODEL: 'admin' is an org-level role and owner-only to grant; org
+// admins delegate by managing members and translators.
 const paEmail = `projadmin-${Date.now()}@test.ca`;
 r = await oa.req('POST', `/api/projects/${orgProjId}/members`, { email: paEmail, name: 'Proj Admin', password: 'projadmin-pass-1', role: 'admin' });
-check('org admin assigns a project admin', r.status === 201, JSON.stringify(r.data));
-r = await oa.req('POST', `/api/orgs/${orgId}/members`, { email: paEmail, role: 'member' });
-check('org admin (non-owner) cannot manage org roles', r.status === 403);
+check('a non-owner cannot grant the admin role (flat model)', r.status === 403, JSON.stringify(r.data));
+r = await oa.req('POST', `/api/projects/${orgProjId}/members`, { email: paEmail, name: 'Proj Admin', password: 'projadmin-pass-1', role: 'member' });
+check('an org admin can add a member (flat model)', r.status === 201, JSON.stringify(r.data));
+r = await oa.req('POST', `/api/orgs/${orgId}/members`, { email: paEmail, role: 'translator' });
+check('an org admin can manage member/translator roles', r.status === 201, JSON.stringify(r.data));
+r = await oa.req('POST', `/api/orgs/${orgId}/members`, { email: paEmail, role: 'admin' });
+check('an org admin cannot grant admin/owner roles (owner-only)', r.status === 403, r.status);
 r = await member.req('GET', `/api/orgs/${orgId}/members`);
 check('ordinary member cannot read org membership', r.status === 403);
 
@@ -1235,7 +1263,6 @@ check('empty org deleted (cleanup restores single-org state)', r.status === 200,
 // STORE-mode zips carry text files uncompressed, so manifest fields are directly
 // searchable in the response buffer — deep assertions without unzipping.
 const zipHas = (z, s) => z.buf.toString('latin1').includes(s);
-const mainOrgId = (await sa.req('GET', '/api/me')).data.orgs[0].id;
 r = await sa.req('POST', `/api/orgs/${mainOrgId}/consent-profiles`, {
   name: `Edu+ASR ${Date.now()}`, allow_language_learning: true, allow_asr_training: true, allow_research: true,
 });
@@ -1918,6 +1945,19 @@ if (BASE.includes('localhost')) {
   } catch (e) {
     check('language-abstraction block ran', false, e.stack || e.message);
   }
+}
+
+// Flat-model cleanup: project deletion no longer cascades people, so remove
+// every org member this run introduced (roster snapshot taken at suite start).
+{
+  r = await sa.req('GET', `/api/orgs/${mainOrgId}/members`);
+  for (const mb of (r.data.members ?? []).filter((m) => !preexistingMembers.has(m.id))) {
+    await sa.req('DELETE', `/api/orgs/${mainOrgId}/members/${mb.id}`);
+  }
+  r = await sa.req('GET', `/api/orgs/${mainOrgId}/members`);
+  check('org roster restored to its pre-suite state (cleanup)',
+    (r.data.members ?? []).every((mb) => preexistingMembers.has(mb.id)),
+    JSON.stringify(r.data.members?.map?.((mb) => mb.email)));
 }
 
 console.log(failures ? `\n${failures} FAILURES` : '\nAll checks passed.');
