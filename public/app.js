@@ -436,7 +436,8 @@ function renderShell() {
     sections.push(`<div class="nav-section"><h3>Library</h3>
       ${navLink('#/entries', 'Entries')}
       ${navLink('#/recordings', 'Recordings')}
-      ${navLink('#/speakers', 'Speakers')}</div>`);
+      ${navLink('#/speakers', 'Speakers')}
+      ${navLink('#/documents', 'Documents')}</div>`);
     sections.push(`<div class="nav-section"><h3>Work</h3>
       ${navLink('#/record', 'Record')}
       ${navLink('#/translate', 'Translate')}
@@ -1415,6 +1416,10 @@ async function renderEntryDetail(id) {
           ${incomplete ? '<span class="badge incomplete">Needs translation</span>' : ''}
           <span>created by ${esc(entry.created_by_name)} on ${fmtDate(entry.created_at)}</span>
           <span>last edited by ${esc(entry.updated_by_name)} on ${fmtDate(entry.updated_at)}</span>
+          ${(entry.sources ?? []).map((s) => `
+            <span>source: ${entry.role === 'translator' ? esc(s.title) : `<a href="#/documents/${s.document_id}">${esc(s.title)}</a>`}${
+              s.location?.sheet ? ` — ${esc(s.location.sheet)}, row ${s.location.row}`
+              : s.location?.row ? ` — row ${s.location.row}` : ''}</span>`).join('')}
         </div>
         <div class="entry-texts">
           <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
@@ -2281,6 +2286,7 @@ async function renderHome() {
       <a href="#/recordings"><div class="stat-tile"><div class="num">${c.recording_count}</div><div class="lbl">Recordings</div></div></a>
       <a href="#/recordings"><div class="stat-tile"><div class="num">${fmtHours(c.audio_seconds)}</div><div class="lbl">Audio hours</div></div></a>
       <a href="#/speakers"><div class="stat-tile"><div class="num">${c.speaker_count}</div><div class="lbl">Speakers</div></div></a>
+      ${isTranslator() ? '' : `<a href="#/documents"><div class="stat-tile"><div class="num">${c.document_count ?? 0}</div><div class="lbl">Documents</div></div></a>`}
     </div>
     ${isActiveOrgAdmin() ? `
       <p style="color:var(--muted)">${c.active_project_count} active project${c.active_project_count === 1 ? '' : 's'}
@@ -2381,6 +2387,436 @@ async function renderSpeakersLibrary() {
       sessions — a person can be recorded without an account, and linked to one later.</p>`
     : `<div class="empty">No speakers yet.<br><br>Speakers are registered when a recording
         session starts — <a href="#/record">start one</a>.</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Documents (documents spec, phases D+E): corpus library of source materials.
+// Upload stores + indexes a source; creating Entries from a spreadsheet is a
+// separate, explicit, reviewed workflow. All extracted content is escaped —
+// never rendered as HTML.
+// ---------------------------------------------------------------------------
+
+let docPollTimer = null;
+function stopDocPolling() {
+  if (docPollTimer) { clearInterval(docPollTimer); docPollTimer = null; }
+}
+
+const DOC_STATUS_LABEL = {
+  uploaded: 'Waiting…', extracting: 'Extracting text…', indexing: 'Indexing…',
+  ready: 'Ready', failed: 'Failed', archived: 'Archived',
+};
+const docStatusBadge = (s) =>
+  `<span class="badge ${s === 'ready' ? 'status-verified' : s === 'failed' ? 'incomplete' : ''}">${DOC_STATUS_LABEL[s] ?? s}</span>`;
+const docLocator = (x) =>
+  x.page_number ? `Page ${x.page_number}`
+  : x.sheet_name ? `${x.sheet_name}${x.row_number ? ` — row ${x.row_number}` : ''}`
+  : x.row_number ? `Row ${x.row_number}` : `¶ ${x.ordinal ?? ''}`;
+
+async function renderDocumentsLibrary() {
+  const corpus = activeCorpus();
+  if (!corpus) { view.innerHTML = '<div class="empty">No collection selected.</div>'; return; }
+  const canUpload = !isTranslator();
+  view.innerHTML = `
+    <div class="page-head"><h1>Documents</h1>
+      <div class="head-actions">${canUpload ? '<button id="doc-upload-btn">⬆ Upload document</button>' : ''}</div></div>
+    <div class="filters">
+      <input type="search" id="doc-q" placeholder="Search inside documents…">
+      <select id="doc-status">
+        <option value="">Status: any</option>
+        ${['ready', 'extracting', 'indexing', 'failed', 'archived'].map((s) => `<option value="${s}">${DOC_STATUS_LABEL[s]}</option>`).join('')}
+      </select>
+      <select id="doc-type">
+        <option value="">Type: any</option>
+        ${[['.pdf', 'PDF'], ['.docx', 'Word'], ['.xlsx', 'Excel'], ['.csv', 'CSV'], ['.txt', 'Text']].map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}
+      </select>
+    </div>
+    <div id="doc-list"><div class="empty">Loading…</div></div>
+    <div class="pager" id="doc-pager"></div>`;
+
+  const load = async (offset = 0) => {
+    const q = $('#doc-q').value.trim();
+    const params = new URLSearchParams({ corpus_id: corpus.id, limit: 50, offset });
+    if (q) params.set('q', q);
+    if ($('#doc-status').value) params.set('status', $('#doc-status').value);
+    if ($('#doc-type').value) params.set('type', $('#doc-type').value);
+    let data;
+    try { data = await api('/documents?' + params); }
+    catch (err) { $('#doc-list').innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+    if (!data.documents.length) {
+      $('#doc-list').innerHTML = q
+        ? '<div class="empty">No documents match.</div>'
+        : `<div class="empty">No documents yet.<br><br>
+            Upload dictionaries, Word files, spreadsheets, phrasebooks and other
+            language materials to make them searchable.<br><br>
+            ${canUpload ? '<button class="btn" id="doc-upload-empty">⬆ Upload document</button>' : ''}</div>`;
+      $('#doc-upload-empty')?.addEventListener('click', showDocumentUploadModal);
+      $('#doc-pager').innerHTML = '';
+      return;
+    }
+    $('#doc-list').innerHTML = `
+      <div class="card"><div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Size</th><th>Uploaded by</th><th>Added</th></tr></thead>
+        <tbody>${data.documents.map((d) => `
+          <tr style="cursor:pointer" data-doc="${d.id}">
+            <td><b>${esc(d.title)}</b>
+              ${d.excerpt ? `<div style="color:var(--muted);font-size:0.85rem">${esc(docLocator(d.excerpt))} · “${esc(d.excerpt.snippet)}”</div>` : ''}</td>
+            <td>${esc(d.type_label)}</td>
+            <td>${docStatusBadge(d.status)}</td>
+            <td>${fmtBytes(d.size_bytes)}</td>
+            <td>${esc(d.uploaded_by_name)}</td>
+            <td style="white-space:nowrap">${fmtDate(d.created_at)}</td>
+          </tr>`).join('')}
+        </tbody></table></div></div>`;
+    $('#doc-pager').innerHTML = data.total > data.limit ? `
+      <button class="ghost small" id="doc-prev" ${offset === 0 ? 'disabled' : ''}>‹ Prev</button>
+      <span>${offset + 1}–${Math.min(offset + data.limit, data.total)} of ${data.total}</span>
+      <button class="ghost small" id="doc-next" ${offset + data.limit >= data.total ? 'disabled' : ''}>Next ›</button>` : '';
+    $('#doc-prev')?.addEventListener('click', () => load(Math.max(0, offset - data.limit)));
+    $('#doc-next')?.addEventListener('click', () => load(offset + data.limit));
+    view.querySelectorAll('tr[data-doc]').forEach((tr) =>
+      tr.addEventListener('click', () => { location.hash = `#/documents/${tr.dataset.doc}`; }));
+  };
+  let t;
+  $('#doc-q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => load(0), 300); });
+  $('#doc-status').addEventListener('change', () => load(0));
+  $('#doc-type').addEventListener('change', () => load(0));
+  $('#doc-upload-btn')?.addEventListener('click', showDocumentUploadModal);
+  load(0);
+}
+
+function showDocumentUploadModal() {
+  const corpus = activeCorpus();
+  const campaigns = corpusProjects().filter((p) => p.status !== 'closed');
+  const m = openModal(`
+    <h2>Upload document</h2>
+    <p style="color:var(--muted);font-size:0.9rem;max-width:52ch">The original file is stored
+      permanently and its text made searchable. Supported: PDF, Word (.docx),
+      Excel (.xlsx), CSV, TXT.</p>
+    <form id="doc-upload-form">
+      <label class="field"><span>File</span>
+        <input type="file" name="file" required accept=".pdf,.docx,.xlsx,.csv,.txt"></label>
+      <label class="field"><span>Title (optional)</span>
+        <input type="text" name="title" placeholder="defaults to the file name"></label>
+      ${campaigns.length > 1 ? `
+      <label class="field"><span>Project source (optional)</span>
+        <select name="origin_project_id"><option value="">— none —</option>
+          ${campaigns.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>` : ''}
+      <p class="error-msg" hidden></p>
+      <div class="form-actions">
+        <button type="submit" id="doc-upload-submit">Upload</button>
+        <button type="button" class="ghost" onclick="document.querySelector('.modal-backdrop').remove()">Cancel</button>
+      </div>
+    </form>`);
+  $('#doc-upload-form', m).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    if (!f.file.files[0]) return;
+    $('#doc-upload-submit').disabled = true;
+    const fd = new FormData();
+    fd.append('file', f.file.files[0]);
+    fd.append('corpus_id', String(activeCorpus().id));
+    if (f.title.value.trim()) fd.append('title', f.title.value.trim());
+    if (f.origin_project_id?.value) fd.append('origin_project_id', f.origin_project_id.value);
+    try {
+      const doc = await api('/documents', { method: 'POST', body: fd });
+      closeModal();
+      toast('Document uploaded. Processing has started.');
+      refreshCorpora();
+      location.hash = `#/documents/${doc.id}`; // hashchange routes to the detail view
+    } catch (err) {
+      $('#doc-upload-submit').disabled = false;
+      showFormError(f, err.message);
+    }
+  });
+}
+
+async function renderDocumentDetail(id) {
+  stopDocPolling();
+  view.innerHTML = '<div class="empty">Loading…</div>';
+  let d;
+  try { d = await api(`/documents/${id}`); }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+
+  const processing = ['uploaded', 'extracting', 'indexing'].includes(d.status);
+  const isSheet = ['.xlsx', '.csv'].includes(d.extension);
+  const sheets = d.extraction?.sheets ?? (d.extension === '.csv' && d.block_count
+    ? [{ name: null, rows: d.extraction?.row_count ?? d.block_count, headers: d.extraction?.headers ?? [] }] : null);
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${esc(d.title)}</h1>
+      <a class="btn secondary" href="#/documents">‹ Back to documents</a>
+    </div>
+    <p style="color:var(--muted)">${esc(d.type_label)} · ${fmtBytes(d.size_bytes)} · ${docStatusBadge(d.status)}<br>
+      Uploaded ${fmtDate(d.created_at)}${d.uploaded_by_name ? ` by ${esc(d.uploaded_by_name)}` : ''}
+      ${d.linked_entry_count ? ` · ${d.linked_entry_count} linked entr${d.linked_entry_count === 1 ? 'y' : 'ies'}` : ''}</p>
+    <div class="rec-actions" style="justify-content:flex-start;margin-bottom:1rem">
+      <a class="btn secondary small" href="/api/language/documents/${d.id}/original">⬇ Download original</a>
+      ${isSheet && d.status === 'ready' && !isTranslator() ? `<button class="small" id="doc-create-entries">Create entries…</button>` : ''}
+      ${d.can_manage ? `
+        <button class="ghost small" id="doc-reprocess">Reprocess</button>
+        ${d.status === 'archived'
+          ? '<button class="ghost small" id="doc-restore">Restore</button>'
+          : '<button class="ghost small" id="doc-archive">Archive</button>'}
+        <button class="danger small" id="doc-delete">Delete</button>` : ''}
+    </div>
+    ${d.status === 'failed' ? `
+      <div class="card"><b>Processing failed.</b>
+        <p style="color:var(--muted)">${esc(d.error_message ?? 'Unknown error')}</p>
+        ${d.can_manage ? '<button id="doc-retry">Try again</button>' : ''}</div>` : ''}
+    ${processing ? `<div class="card" id="doc-processing">${DOC_STATUS_LABEL[d.status]}</div>` : ''}
+    ${d.extraction?.requires_ocr ? `
+      <div class="card" style="color:var(--muted)">No searchable text was found — this PDF may be scanned.
+        The original is stored safely; a future OCR pass can process it.</div>` : ''}
+    ${d.status === 'ready' ? `
+      <div class="card">
+        <label class="field" style="max-width:420px"><span>Search this document</span>
+          <input type="search" id="doc-search" placeholder="e.g. a word or phrase"></label>
+        <div id="doc-search-results"></div>
+      </div>
+      <div class="card" id="doc-content"><div class="empty">Loading content…</div></div>` : ''}`;
+
+  $('#doc-reprocess')?.addEventListener('click', async () => {
+    if (!confirm('Re-run extraction and indexing? The original file is untouched.')) return;
+    try { await api(`/documents/${d.id}/reprocess`, { method: 'POST' }); renderDocumentDetail(id); }
+    catch (err) { toast(err.message, true); }
+  });
+  $('#doc-retry')?.addEventListener('click', async () => {
+    try { await api(`/documents/${d.id}/reprocess`, { method: 'POST' }); renderDocumentDetail(id); }
+    catch (err) { toast(err.message, true); }
+  });
+  $('#doc-archive')?.addEventListener('click', async () => {
+    if (!confirm('Archive this document? It leaves browse and search but is kept, with its provenance, and can be restored.')) return;
+    try { await api(`/documents/${d.id}/archive`, { method: 'POST' }); toast('Document archived'); renderDocumentDetail(id); }
+    catch (err) { toast(err.message, true); }
+  });
+  $('#doc-restore')?.addEventListener('click', async () => {
+    try { await api(`/documents/${d.id}/restore`, { method: 'POST' }); toast('Document restored'); renderDocumentDetail(id); }
+    catch (err) { toast(err.message, true); }
+  });
+  $('#doc-delete')?.addEventListener('click', async () => {
+    const t = prompt('Permanently delete this document and its extracted text?\nType the exact title to confirm:');
+    if (t === null) return;
+    try {
+      await api(`/documents/${d.id}`, { method: 'DELETE', body: { confirm_title: t } });
+      toast('Document deleted');
+      refreshCorpora();
+      location.hash = '#/documents';
+    } catch (err) { toast(err.message, true); }
+  });
+  $('#doc-create-entries')?.addEventListener('click', () => showCreateEntriesWizard(d));
+
+  // Poll while ingestion runs; stop on terminal states or navigation.
+  if (processing) {
+    docPollTimer = setInterval(async () => {
+      try {
+        const fresh = await api(`/documents/${id}`);
+        if (fresh.status !== d.status) { stopDocPolling(); renderDocumentDetail(id); }
+      } catch { stopDocPolling(); }
+    }, 1500);
+    return;
+  }
+  if (d.status !== 'ready') return;
+
+  // In-document search.
+  let st;
+  $('#doc-search').addEventListener('input', () => {
+    clearTimeout(st);
+    st = setTimeout(async () => {
+      const q = $('#doc-search').value.trim();
+      const box = $('#doc-search-results');
+      if (!q) { box.innerHTML = ''; return; }
+      try {
+        const { results } = await api(`/documents/${d.id}/search?q=${encodeURIComponent(q)}`);
+        box.innerHTML = results.length
+          ? results.map((x) => `
+              <div class="version-row" style="cursor:pointer" data-page="${x.page_number ?? ''}" data-sheet="${esc(x.sheet_name ?? '')}">
+                <span><span class="badge">${esc(docLocator(x))}</span> ${esc(x.snippet)}</span>
+              </div>`).join('')
+          : '<p class="empty">No matches in this document.</p>';
+        box.querySelectorAll('[data-page],[data-sheet]').forEach((el) =>
+          el.addEventListener('click', () => loadDocContent(d, { page: el.dataset.page, sheet: el.dataset.sheet })));
+      } catch (err) { box.innerHTML = `<p class="empty">${esc(err.message)}</p>`; }
+    }, 300);
+  });
+
+  // Content: sheet chooser for spreadsheets, paged blocks otherwise.
+  async function loadDocContent(doc, { page = '', sheet = '', offset = 0 } = {}) {
+    const box = $('#doc-content');
+    if (!box) return;
+    const params = new URLSearchParams({ limit: 100, offset });
+    if (page) params.set('page', page);
+    if (sheet) params.set('sheet', sheet);
+    let data;
+    try { data = await api(`/documents/${doc.id}/blocks?` + params); }
+    catch (err) { box.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+    const sheetPicker = sheets?.length && sheets[0].name ? `
+      <div style="margin-bottom:0.7rem">Sheets: ${sheets.map((s) =>
+        `<button class="ghost small" data-open-sheet="${esc(s.name)}">${esc(s.name)} (${s.rows} rows)</button>`).join(' ')}</div>` : '';
+    let body;
+    if (!data.blocks.length) {
+      body = '<p class="empty">No extracted content.</p>';
+    } else if (data.blocks[0].block_type === 'sheet_row') {
+      const headers = Object.keys(JSON.parse(data.blocks[0].metadata_json ?? '{}').cells ?? {});
+      body = `<div class="table-wrap"><table>
+        <thead><tr><th>Row</th>${headers.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead>
+        <tbody>${data.blocks.map((b) => {
+          const cells = JSON.parse(b.metadata_json ?? '{}').cells ?? {};
+          return `<tr><td style="color:var(--muted)">${b.row_number ?? b.ordinal}</td>
+            ${headers.map((h) => `<td>${esc(String(cells[h] ?? ''))}</td>`).join('')}</tr>`;
+        }).join('')}</tbody></table></div>`;
+    } else {
+      let lastPage = null;
+      body = data.blocks.map((b) => {
+        const pageHead = b.page_number && b.page_number !== lastPage
+          ? `<h3 style="margin:1rem 0 0.3rem;color:var(--muted)">Page ${b.page_number}</h3>` : '';
+        lastPage = b.page_number ?? lastPage;
+        const tag = b.block_type === 'heading' ? 'h3' : 'p';
+        return `${pageHead}<${tag} style="white-space:pre-wrap">${esc(b.text)}</${tag}>`;
+      }).join('');
+    }
+    const pager = data.total > data.limit ? `
+      <div class="pager">
+        <button class="ghost small" id="db-prev" ${offset === 0 ? 'disabled' : ''}>‹ Prev</button>
+        <span>${offset + 1}–${Math.min(offset + data.limit, data.total)} of ${data.total}</span>
+        <button class="ghost small" id="db-next" ${offset + data.limit >= data.total ? 'disabled' : ''}>Next ›</button>
+      </div>` : '';
+    box.innerHTML = `<h2 style="margin-top:0">Content${sheet ? ` — ${esc(sheet)}` : page ? ` — page ${page}` : ''}</h2>${sheetPicker}${body}${pager}`;
+    box.querySelectorAll('[data-open-sheet]').forEach((btn) =>
+      btn.addEventListener('click', () => loadDocContent(doc, { sheet: btn.dataset.openSheet })));
+    $('#db-prev')?.addEventListener('click', () => loadDocContent(doc, { page, sheet, offset: Math.max(0, offset - data.limit) }));
+    $('#db-next')?.addEventListener('click', () => loadDocContent(doc, { page, sheet, offset: offset + data.limit }));
+  }
+  loadDocContent(d, sheets?.length && sheets[0].name ? { sheet: sheets[0].name } : {});
+}
+
+// Structured import wizard (documents spec §43): sheet -> column mapping ->
+// kind -> preview -> confirm. Entry creation happens server-side with the
+// corpus dedup rules; every entry keeps sheet/row provenance.
+async function showCreateEntriesWizard(d) {
+  const sheets = (d.extraction?.sheets ?? []).filter((s) => s.rows > 0);
+  const singleSheet = !sheets.length || !sheets[0]?.name;
+  const campaigns = corpusProjects().filter((p) => p.status !== 'closed');
+  const state_ = { sheet: singleSheet ? null : sheets[0].name, kind: 'word' };
+
+  const headersFor = async () => {
+    if (!singleSheet) return sheets.find((s) => s.name === state_.sheet)?.headers ?? [];
+    if (d.extraction?.headers) return d.extraction.headers;
+    const { blocks } = await api(`/documents/${d.id}/blocks?limit=1`);
+    return Object.keys(JSON.parse(blocks[0]?.metadata_json ?? '{}').cells ?? {});
+  };
+  const guess = (h) => {
+    const s = h.toLowerCase();
+    if (/dene|slavey|tł|indigenous|word|phrase/.test(s) && !/english/.test(s)) return 'dene';
+    if (/english|meaning|translation|gloss/.test(s)) return 'english';
+    if (/categor|topic|tag/.test(s)) return 'category';
+    if (/note|comment/.test(s)) return 'notes';
+    return '';
+  };
+
+  const headers = await headersFor();
+  const m = openModal(`
+    <h2>Create entries from ${esc(d.title)}</h2>
+    <form id="wizard-form">
+      ${!singleSheet ? `
+      <label class="field"><span>Sheet</span>
+        <select name="sheet">${sheets.map((s) => `<option value="${esc(s.name)}">${esc(s.name)} (${s.rows} rows)</option>`).join('')}</select></label>` : ''}
+      <label class="field"><span>Create as</span>
+        <select name="kind"><option value="word">Dictionary words</option><option value="phrase">Phrases</option></select></label>
+      ${campaigns.length > 1 ? `
+      <label class="field"><span>Project (campaign the work belongs to)</span>
+        <select name="origin_project_id">${campaigns.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>` : ''}
+      <div id="wizard-mapping"></div>
+      <div id="wizard-preview" style="margin-top:0.6rem"></div>
+      <p class="error-msg" hidden></p>
+      <div class="form-actions">
+        <button type="button" class="secondary" id="wizard-preview-btn">Preview</button>
+        <button type="submit" id="wizard-confirm" disabled>Create entries</button>
+        <button type="button" class="ghost" onclick="document.querySelector('.modal-backdrop').remove()">Cancel</button>
+      </div>
+    </form>`);
+
+  const renderMapping = (hs) => {
+    $('#wizard-mapping', m).innerHTML = `
+      <p style="margin:0.6rem 0 0.2rem;font-weight:600">Column mapping</p>
+      ${hs.map((h) => `
+        <label class="field" style="flex-direction:row;align-items:center;gap:0.6rem;max-width:420px">
+          <span style="flex:1">${esc(h)}</span>
+          <select data-map="${esc(h)}">
+            <option value="">Ignore</option>
+            <option value="dene" ${guess(h) === 'dene' ? 'selected' : ''}>Dene text</option>
+            <option value="english" ${guess(h) === 'english' ? 'selected' : ''}>English text</option>
+            <option value="category" ${guess(h) === 'category' ? 'selected' : ''}>Category</option>
+            <option value="notes" ${guess(h) === 'notes' ? 'selected' : ''}>Notes</option>
+          </select>
+        </label>`).join('')}`;
+  };
+  renderMapping(headers);
+  m.querySelector('[name=sheet]')?.addEventListener('change', async (e) => {
+    state_.sheet = e.target.value;
+    renderMapping(await headersFor());
+    $('#wizard-preview', m).innerHTML = '';
+    $('#wizard-confirm', m).disabled = true;
+  });
+
+  const currentMapping = () => {
+    const map = {};
+    m.querySelectorAll('[data-map]').forEach((sel) => { if (sel.value) map[sel.dataset.map] = sel.value; });
+    return map;
+  };
+
+  $('#wizard-preview-btn', m).addEventListener('click', async () => {
+    const mapping = currentMapping();
+    if (!Object.values(mapping).some((v) => v === 'dene' || v === 'english')) {
+      showFormError($('#wizard-form', m), 'Map at least one column to Dene text or English text');
+      return;
+    }
+    const params = new URLSearchParams({ limit: 200 });
+    if (state_.sheet) params.set('sheet', state_.sheet);
+    const { blocks, total } = await api(`/documents/${d.id}/blocks?` + params);
+    const mapped = blocks.map((b) => {
+      const cells = JSON.parse(b.metadata_json ?? '{}').cells ?? {};
+      const get = (f) => Object.entries(mapping).filter(([, v]) => v === f).map(([h]) => String(cells[h] ?? '').trim()).find(Boolean) ?? '';
+      return { row: b.row_number ?? b.ordinal, dene: get('dene'), english: get('english') };
+    });
+    const valid = mapped.filter((r) => r.dene || r.english);
+    $('#wizard-preview', m).innerHTML = `
+      <p style="font-weight:600;margin:0.4rem 0 0.2rem">Preview (first ${Math.min(20, valid.length)} of ~${total} rows · ${valid.length} usable in sample, ${mapped.length - valid.length} empty)</p>
+      <div class="table-wrap" style="max-height:220px;overflow:auto"><table>
+        <thead><tr><th>Row</th><th>Dene</th><th>English</th></tr></thead>
+        <tbody>${valid.slice(0, 20).map((r) => `
+          <tr><td style="color:var(--muted)">${r.row}</td>
+              <td class="dene" lang="den">${esc(r.dene) || '<i style="color:var(--muted)">— queued for translation —</i>'}</td>
+              <td>${esc(r.english) || '<i style="color:var(--muted)">— queued for translation —</i>'}</td></tr>`).join('')}
+        </tbody></table></div>`;
+    $('#wizard-confirm', m).disabled = valid.length === 0;
+  });
+
+  $('#wizard-form', m).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    $('#wizard-confirm', m).disabled = true;
+    try {
+      const r = await api(`/documents/${d.id}/create-entries`, {
+        method: 'POST',
+        body: {
+          sheet: state_.sheet ?? undefined,
+          kind: f.kind.value,
+          mapping: currentMapping(),
+          origin_project_id: f.origin_project_id?.value ? Number(f.origin_project_id.value) : undefined,
+        },
+      });
+      closeModal();
+      toast(`Created ${r.created} entr${r.created === 1 ? 'y' : 'ies'}`
+        + (r.skipped_duplicates ? ` · ${r.skipped_duplicates} duplicates skipped` : '')
+        + (r.skipped_already_imported ? ` · ${r.skipped_already_imported} already imported` : ''));
+      refreshCorpora();
+      renderDocumentDetail(d.id);
+    } catch (err) {
+      $('#wizard-confirm', m).disabled = false;
+      showFormError(f, err.message);
+    }
+  });
 }
 
 async function renderProjects() {
@@ -3073,6 +3509,7 @@ async function refreshCorpora() {
 
 function route() {
   view.onclick = null; // clear any per-view delegated handler
+  stopDocPolling(); // navigating away ends document status polling
   if (Recorder.session) Recorder.cancel(); // navigating away releases the mic
   releaseClaims(recSession); // return any unfinished claimed work to the queue
   releaseClaims(transSession);
@@ -3111,6 +3548,8 @@ function route() {
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
   else if (hash === '#/recordings') renderRecordingsLibrary();
   else if (hash === '#/speakers') renderSpeakersLibrary();
+  else if (hash === '#/documents') renderDocumentsLibrary();
+  else if ((m = hash.match(/^#\/documents\/(\d+)$/))) renderDocumentDetail(m[1]);
   else if (hash === '#/record') renderRecordSession();
   else if (hash === '#/translate') renderTranslateSession();
   else if (hash === '#/earnings') renderMyEarnings();
