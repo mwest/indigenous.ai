@@ -1873,6 +1873,125 @@ if (BASE.includes('localhost')) {
   check('doc: cleanup complete', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- structured import: spreadsheet -> Entries (documents spec phase E, §43–45) ---
+{
+  const { default: db } = await import('../src/db.js');
+  const ts = Date.now();
+  const impProjName = `Import ${ts}`;
+  r = await sa.req('POST', '/api/projects', { name: impProjName, dialect: 'Dëne Sųłıné' });
+  const impProj = r.data;
+  const impCorpus = impProj.corpus_id;
+
+  const upload = async (name, buf, extra = {}) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([buf]), name);
+    fd.append('corpus_id', String(impCorpus));
+    for (const [k, v] of Object.entries(extra)) fd.append(k, v);
+    return sa.req('POST', '/api/documents', fd, true);
+  };
+  const waitReady = async (id) => {
+    for (let i = 0; i < 80; i++) {
+      const d = (await sa.req('GET', `/api/documents/${id}`)).data;
+      if (['ready', 'failed'].includes(d.status)) return d;
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return (await sa.req('GET', `/api/documents/${id}`)).data;
+  };
+
+  // Pre-existing corpus entry: the spreadsheet row that matches it must dedup.
+  r = await sa.req('POST', '/api/entries', { project_id: impProj.id, kind: 'word', dene_text: 'tu', english_text: 'water' });
+  const preexistingId = r.data.id;
+
+  // Workbook: dup-of-existing, fresh rows, a one-sided row, an in-sheet
+  // duplicate, and a second sheet that must NOT be touched.
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Words');
+  ws.addRow(['English', 'Dene', 'Category']);
+  ws.addRow(['water', 'tu', 'nature']);           // dup of existing corpus entry
+  ws.addRow(['fish', 'łue', 'animals']);          // fresh
+  ws.addRow(['money', 'sǫǫ̀mbaà', '']);            // fresh, diacritics
+  ws.addRow(['bear', '', 'animals']);             // one-sided -> queued for translation
+  ws.addRow(['fish', 'łue', 'animals']);          // in-sheet duplicate
+  const ws2 = wb.addWorksheet('Other');
+  ws2.addRow(['English', 'Dene']);
+  ws2.addRow(['do not import', 'xxx']);
+  r = await upload('import.xlsx', Buffer.from(await wb.xlsx.writeBuffer()));
+  const impDoc = await waitReady(r.data.id);
+  check('import: workbook ready', impDoc.status === 'ready', impDoc.error_message ?? impDoc.status);
+
+  const mapping = { English: 'english', Dene: 'dene', Category: 'category' };
+
+  // Guards first: bad mapping, wrong format, wrong role.
+  r = await sa.req('POST', `/api/documents/${impDoc.id}/create-entries`, { kind: 'word', mapping: { Category: 'category' } });
+  check('import: mapping must include dene or english', r.status === 400, r.status);
+  r = await upload('notes.txt', Buffer.from('plain notes\n'));
+  const impTxt = await waitReady(r.data.id);
+  r = await sa.req('POST', `/api/documents/${impTxt.id}/create-entries`, { kind: 'word', mapping });
+  check('import: only spreadsheets can create entries', r.status === 400, r.status);
+  const itrEmail = `imptr-${ts}@test.ca`;
+  await sa.req('POST', `/api/projects/${impProj.id}/members`, { email: itrEmail, name: 'Imp Translator', password: 'imptr-pass-1', role: 'translator' });
+  const itr = client();
+  await itr.req('POST', '/api/login', { email: itrEmail, password: 'imptr-pass-1' });
+  r = await itr.req('POST', `/api/documents/${impDoc.id}/create-entries`, { sheet: 'Words', kind: 'word', mapping });
+  check('import: translators cannot create entries from documents', r.status === 403, r.status);
+
+  // The real import: only the chosen sheet, corpus dedup, one-sided rows kept.
+  r = await sa.req('POST', `/api/documents/${impDoc.id}/create-entries`,
+    { sheet: 'Words', kind: 'word', mapping, origin_project_id: impProj.id });
+  check('import: created 3, skipped 1 corpus dup + 1 in-sheet dup',
+    r.status === 200 && r.data.created === 3 && r.data.skipped_duplicates === 2 && r.data.project_id === impProj.id,
+    JSON.stringify(r.data));
+  const entries = db.prepare('SELECT * FROM entries WHERE corpus_id = ? ORDER BY id').all(impCorpus);
+  check('import: corpus now holds preexisting + 3 imported', entries.length === 4, entries.length);
+  check('import: entries carry corpus + origin-project provenance',
+    entries.every((e) => e.corpus_id === impCorpus && e.project_id === impProj.id));
+  const bear = entries.find((e) => e.english_text === 'bear');
+  check('import: one-sided row imported queued for translation', bear && bear.dene_text === '', JSON.stringify(bear?.dene_text));
+  check('import: the untouched sheet stayed untouched', !entries.some((e) => e.english_text === 'do not import'));
+  const money = entries.find((e) => e.english_text === 'money');
+  check('import: diacritics preserved exactly', money?.dene_text === 'sǫǫ̀mbaà', JSON.stringify(money?.dene_text));
+
+  // Entry -> Document provenance with sheet/row locator, retrievable via API.
+  const fish = entries.find((e) => e.english_text === 'fish');
+  r = await sa.req('GET', `/api/entries/${fish.id}`);
+  const src = r.data.sources?.[0];
+  check('import: entry cites its source document with sheet and row',
+    src && src.document_id === impDoc.id && src.location?.sheet === 'Words' && src.location?.row === 3,
+    JSON.stringify(src));
+
+  // Re-confirming the same import must be a no-op (block-level idempotency).
+  r = await sa.req('POST', `/api/documents/${impDoc.id}/create-entries`,
+    { sheet: 'Words', kind: 'word', mapping, origin_project_id: impProj.id });
+  check('import: re-running creates nothing new',
+    r.data.created === 0 && r.data.skipped_already_imported === 3,
+    JSON.stringify(r.data));
+  check('import: still 4 entries after re-run',
+    db.prepare('SELECT COUNT(*) n FROM entries WHERE corpus_id = ?').get(impCorpus).n === 4);
+
+  // Hard delete refused while entries cite the document; archive is the path.
+  r = await sa.req('DELETE', `/api/documents/${impDoc.id}`, { confirm_title: impDoc.title });
+  check('import: delete refused while entries cite the document', r.status === 409, r.status);
+  r = await sa.req('POST', `/api/documents/${impDoc.id}/archive`);
+  check('import: archive works instead', r.status === 200, r.status);
+  r = await sa.req('GET', `/api/entries/${fish.id}`);
+  check('import: provenance survives archiving', r.data.sources?.[0]?.document_id === impDoc.id);
+
+  // cleanup: entries first (releases the citation), then documents, project, translator.
+  for (const e of entries.filter((x) => x.id !== preexistingId)) {
+    await sa.req('DELETE', `/api/entries/${e.id}`);
+  }
+  await sa.req('DELETE', `/api/entries/${preexistingId}`);
+  await sa.req('POST', `/api/documents/${impDoc.id}/restore`);
+  r = await sa.req('DELETE', `/api/documents/${impDoc.id}`, { confirm_title: impDoc.title });
+  check('import: delete allowed once no entries cite it', r.status === 200, r.status);
+  await sa.req('DELETE', `/api/documents/${impTxt.id}`, { confirm_title: impTxt.title });
+  await sa.req('DELETE', `/api/projects/${impProj.id}`, { confirm_name: impProjName });
+  const itrUser = db.prepare('SELECT id FROM users WHERE email = ?').get(itrEmail);
+  r = await sa.req('DELETE', `/api/users/${itrUser.id}`);
+  check('import: cleanup complete', r.status === 200, JSON.stringify(r.data));
+}
+
 // --- root sign-in page ---
 {
   const anon = client();

@@ -817,7 +817,8 @@ language.get('/corpora', (req, res) => {
                 WHERE e.corpus_id = c.id AND a.is_current = 1) AS recording_count,
               (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a JOIN entries e ON e.id = a.entry_id
                 WHERE e.corpus_id = c.id AND a.is_current = 1) AS audio_seconds,
-              (SELECT COUNT(*) FROM speakers s WHERE s.organization_id = c.organization_id) AS speaker_count
+              (SELECT COUNT(*) FROM speakers s WHERE s.organization_id = c.organization_id) AS speaker_count,
+              (SELECT COUNT(*) FROM documents d WHERE d.corpus_id = c.id AND d.status <> 'archived') AS document_count
        FROM corpora c WHERE c.organization_id IN (${ph}) ORDER BY c.name`
     )
     .all(...orgIds);
@@ -1047,6 +1048,92 @@ language.delete('/documents/:id', loadDocument({ manage: true }), (req, res) => 
   const result = documents.deleteDocument(req.document.id);
   if (result.error) return bad(res, result.error, 409);
   res.json({ ok: true });
+});
+
+// Structured import (documents spec §43–§45): the EXPLICIT, reviewed path
+// from a spreadsheet document into corpus entries. Reuses the corpus dedup
+// rules; every created entry keeps sheet/row provenance, and re-confirming
+// the same rows is a no-op (blocks already linked are skipped).
+language.post('/documents/:id/create-entries', loadDocument({ upload: true }), (req, res) => {
+  const doc = req.document;
+  if (doc.status !== 'ready') return bad(res, 'The document must finish processing first');
+  if (!['.xlsx', '.csv'].includes(doc.extension)) {
+    return bad(res, 'Entries can be created from spreadsheets (Excel/CSV) only');
+  }
+  const kind = req.body?.kind === 'phrase' ? 'phrase' : 'word';
+  const mapping = req.body?.mapping ?? {}; // { columnHeader: 'dene'|'english'|'category'|'notes' }
+  const fields = Object.entries(mapping)
+    .filter(([, v]) => ['dene', 'english', 'category', 'notes'].includes(v));
+  if (!fields.some(([, v]) => v === 'dene' || v === 'english')) {
+    return bad(res, 'Map at least one column to Dene text or English text');
+  }
+  const sheet = req.body?.sheet ? String(req.body.sheet) : null;
+  const campaigns = db.prepare(`SELECT id FROM projects WHERE corpus_id = ? AND status <> 'closed'`)
+    .all(doc.corpus_id).map((r) => r.id);
+  let projectId = Number(req.body?.origin_project_id || 0) || null;
+  if (projectId && !campaigns.includes(projectId)) {
+    return bad(res, 'That project is not an open campaign on this collection');
+  }
+  if (!projectId) projectId = campaigns[0];
+  if (!projectId) return bad(res, 'This collection has no open project to attribute the entries to');
+
+  const version = documents.currentVersion(doc.id);
+  const where = ['document_version_id = ?', `block_type = 'sheet_row'`];
+  const params = [version.id];
+  if (sheet) { where.push('sheet_name = ?'); params.push(sheet); }
+  const blocks = db.prepare(`SELECT * FROM document_blocks WHERE ${where.join(' AND ')} ORDER BY ordinal`)
+    .all(...params);
+  if (!blocks.length) return bad(res, 'No rows found for that sheet');
+
+  const seen = new Set(
+    db.prepare('SELECT dene_text, english_text FROM entries WHERE corpus_id = ? AND kind = ?')
+      .all(doc.corpus_id, kind).map((e) => JSON.stringify([e.dene_text, e.english_text]))
+  );
+  const linked = new Set(
+    db.prepare('SELECT document_block_id FROM entry_document_sources WHERE document_id = ?')
+      .all(doc.id).map((r) => r.document_block_id)
+  );
+  const insertEntry = db.prepare(
+    `INSERT INTO entries (uid, project_id, corpus_id, kind, dene_text, english_text, category, notes,
+       source_doc, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertSource = db.prepare(
+    `INSERT INTO entry_document_sources (entry_id, document_id, document_block_id, location_json)
+     VALUES (?, ?, ?, ?)`
+  );
+  let created = 0, dup = 0, empty = 0, already = 0;
+  db.transaction(() => {
+    for (const b of blocks) {
+      if (linked.has(b.id)) { already++; continue; }
+      const cells = b.metadata_json ? (JSON.parse(b.metadata_json).cells ?? {}) : {};
+      const val = (field) => fields.filter(([, v]) => v === field)
+        .map(([h]) => String(cells[h] ?? '').trim()).find(Boolean) ?? '';
+      const dene = val('dene');
+      const english = val('english');
+      // A row imports as long as EITHER side has text (one-sided entries are
+      // queued for translation, same as everywhere else).
+      if (!dene && !english) { empty++; continue; }
+      const key = JSON.stringify([dene, english]);
+      if (seen.has(key)) { dup++; continue; }
+      seen.add(key);
+      const locator = `${b.sheet_name ? `${b.sheet_name}, ` : ''}row ${b.row_number ?? b.ordinal}`;
+      const entryId = insertEntry.run(uuidv7(), projectId, doc.corpus_id, kind, dene, english,
+        val('category') || null, val('notes') || null, `${doc.title} — ${locator}`,
+        req.user.id, req.user.id).lastInsertRowid;
+      syncEntryTexts(db, entryId, req.user.id);
+      insertSource.run(entryId, doc.id, b.id,
+        JSON.stringify({ sheet: b.sheet_name ?? null, row: b.row_number ?? null }));
+      created++;
+    }
+  })();
+  if (created > 0) {
+    backfillEmbeddings((m) => console.log('[embed:documents]', m))
+      .catch((e) => console.error('[embed:documents] backfill failed:', e.message));
+  }
+  console.log(`[documents] created ${created} entries from ${doc.uid} (${dup} dups, ${empty} empty, ${already} already imported)`);
+  res.json({ ok: true, created, skipped_duplicates: dup, skipped_empty: empty,
+    skipped_already_imported: already, project_id: projectId, kind });
 });
 
 language.get('/projects', (req, res) => {
@@ -1766,7 +1853,16 @@ language.get('/entries/:id', loadEntry, (req, res) => {
        ORDER BY a.language, a.created_at`
     )
     .all(req.entry.id);
-  res.json({ ...req.entry, audio, can_edit: canEditEntry(req), role: req.projectRole });
+  // Document provenance (documents spec §44): where this entry came from.
+  const sources = db
+    .prepare(
+      `SELECT eds.document_id, eds.location_json, d.title, d.status, d.extension
+       FROM entry_document_sources eds JOIN documents d ON d.id = eds.document_id
+       WHERE eds.entry_id = ? ORDER BY eds.created_at`
+    )
+    .all(req.entry.id)
+    .map((s) => ({ ...s, location: s.location_json ? JSON.parse(s.location_json) : null }));
+  res.json({ ...req.entry, audio, sources, can_edit: canEditEntry(req), role: req.projectRole });
 });
 
 language.patch('/entries/:id', loadEntry, (req, res) => {
