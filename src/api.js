@@ -793,6 +793,101 @@ const projectStats = db.prepare(`
 const projectStatsFor = (projectId) =>
   projectStats.get(projectId, projectId, projectId, projectId, projectId, projectId);
 
+// ---------------------------------------------------------------------------
+// Corpora (nav spec §7): the client's corpus selector and Home view. Corpora
+// the user can see = corpora of orgs they belong to, intersected with Language
+// entitlement — never derived client-side from project names.
+// ---------------------------------------------------------------------------
+
+language.get('/corpora', (req, res) => {
+  const entitled = entitledLanguageOrgs();
+  const orgIds = orgsFor(req.user).map((o) => o.id).filter((id) => entitled.has(id));
+  if (!orgIds.length) return res.json({ corpora: [] });
+  const ph = orgIds.map(() => '?').join(',');
+  const corpora = db
+    .prepare(
+      `SELECT c.id, c.uid, c.organization_id, c.name, c.primary_variety_id,
+              (SELECT COUNT(*) FROM projects p WHERE p.corpus_id = c.id) AS project_count,
+              (SELECT COUNT(*) FROM projects p WHERE p.corpus_id = c.id AND p.status = 'active') AS active_project_count,
+              (SELECT COUNT(*) FROM entries e WHERE e.corpus_id = c.id) AS entry_count,
+              (SELECT COUNT(*) FROM audio_files a JOIN entries e ON e.id = a.entry_id
+                WHERE e.corpus_id = c.id AND a.is_current = 1) AS recording_count,
+              (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a JOIN entries e ON e.id = a.entry_id
+                WHERE e.corpus_id = c.id AND a.is_current = 1) AS audio_seconds,
+              (SELECT COUNT(*) FROM speakers s WHERE s.organization_id = c.organization_id) AS speaker_count
+       FROM corpora c WHERE c.organization_id IN (${ph}) ORDER BY c.name`
+    )
+    .all(...orgIds);
+  res.json({ corpora });
+});
+
+/** The corpora visible to the user (access ∩ entitlement), as a Set of ids. */
+function visibleCorpusIds(user) {
+  const entitled = entitledLanguageOrgs();
+  const orgIds = orgsFor(user).map((o) => o.id).filter((id) => entitled.has(id));
+  if (!orgIds.length) return new Set();
+  const rows = db
+    .prepare(`SELECT id FROM corpora WHERE organization_id IN (${orgIds.map(() => '?').join(',')})`)
+    .all(...orgIds);
+  return new Set(rows.map((r) => r.id));
+}
+
+// Library: corpus-level recordings browser (nav spec §11) — CURRENT versions
+// with entry text, speaker, and origin-campaign provenance.
+language.get('/recordings', (req, res) => {
+  const corpusId = Number(req.query.corpus_id || 0);
+  if (!corpusId || !visibleCorpusIds(req.user).has(corpusId)) {
+    return bad(res, 'Not a member of this collection', 403);
+  }
+  const q = String(req.query.q ?? '').trim();
+  const language_ = req.query.language === 'english' ? 'english' : req.query.language === 'dene' ? 'dene' : null;
+  const where = ['e.corpus_id = ?', 'a.is_current = 1'];
+  const params = [corpusId];
+  if (language_) { where.push('a.language = ?'); params.push(language_); }
+  if (q) {
+    where.push('(e.dene_text LIKE ? OR e.english_text LIKE ? OR s.display_name LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  }
+  const whereSql = `WHERE ${where.join(' AND ')}`;
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const base = `FROM audio_files a
+       JOIN entries e ON e.id = a.entry_id
+       LEFT JOIN speakers s ON s.id = a.speaker_id
+       LEFT JOIN projects op ON op.id = e.project_id`;
+  const total = db.prepare(`SELECT COUNT(*) n ${base} ${whereSql}`).get(...params).n;
+  const recordings = db
+    .prepare(
+      `SELECT a.id, a.uid, a.entry_id, a.language, a.duration_seconds, a.archive_class,
+              a.created_at, s.display_name AS speaker_name, op.name AS origin_project_name,
+              e.dene_text, e.english_text
+       ${base} ${whereSql}
+       ORDER BY a.created_at DESC, a.id DESC LIMIT ? OFFSET ?`
+    )
+    .all(...params, limit, offset);
+  res.json({ recordings, total, limit, offset });
+});
+
+// Library: speakers page (nav spec §11) — the corpus's org speakers with
+// recording rollups.
+language.get('/speakers', (req, res) => {
+  const corpusId = Number(req.query.corpus_id || 0);
+  if (!corpusId || !visibleCorpusIds(req.user).has(corpusId)) {
+    return bad(res, 'Not a member of this collection', 403);
+  }
+  const orgId = db.prepare('SELECT organization_id FROM corpora WHERE id = ?').get(corpusId).organization_id;
+  const speakers = db
+    .prepare(
+      `SELECT s.id, s.uid, s.display_name, s.user_id, s.notes, u.name AS user_name,
+              (SELECT COUNT(*) FROM audio_files a WHERE a.speaker_id = s.id AND a.is_current = 1) AS recording_count,
+              (SELECT MAX(a.created_at) FROM audio_files a WHERE a.speaker_id = s.id) AS last_recording_at
+       FROM speakers s LEFT JOIN users u ON u.id = s.user_id
+       WHERE s.organization_id = ? ORDER BY s.display_name`
+    )
+    .all(orgId);
+  res.json({ speakers });
+});
+
 language.get('/projects', (req, res) => {
   // Visible = accessible ∩ entitled: projects in Language-disabled orgs are
   // excluded, for every caller (two-fixes §1.5).
@@ -1274,8 +1369,14 @@ language.get('/entries', async (req, res) => {
   const where = [];
   const params = [];
 
+  const corpusParam = req.query.corpus_id ? Number(req.query.corpus_id) : null;
   const projectId = req.query.project_id ? Number(req.query.project_id) : null;
-  if (projectId) {
+  if (corpusParam) {
+    // Library scope (nav spec §8): the corpus IS the content context.
+    if (!visibleCorpora.includes(corpusParam)) return bad(res, 'Not a member of this collection', 403);
+    where.push('e.corpus_id = ?');
+    params.push(corpusParam);
+  } else if (projectId) {
     if (!visibleIds.includes(projectId)) return bad(res, 'Not a member of this project', 403);
     const corpusId = visibleProjects.find((p) => p.id === projectId)?.corpus_id;
     if (corpusId) {

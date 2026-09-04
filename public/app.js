@@ -44,7 +44,9 @@ class ApiError extends Error {
 
 const state = {
   me: null,          // { user, projects, orgs }
+  corpora: [],       // visible collections (GET /corpora)
   activeOrgId: Number(localStorage.getItem('activeOrgId')) || null,
+  activeCorpusId: Number(localStorage.getItem('activeCorpusId')) || null,
   activeProjectId: Number(localStorage.getItem('activeProjectId')) || null,
 };
 
@@ -114,20 +116,51 @@ function orgProjects() {
   return org ? projects.filter((p) => p.organization_id === org.id) : projects;
 }
 
+// The active CORPUS ("Collection" in the UI) is the content context for the
+// Library (nav spec §7): Entries, Recordings, Speakers browse the corpus.
+// Projects/campaigns scope only funded WORK.
+function orgCorpora() {
+  const org = activeOrg();
+  return org ? state.corpora.filter((c) => c.organization_id === org.id) : [];
+}
+
+function activeCorpus() {
+  const corpora = orgCorpora();
+  return corpora.find((c) => c.id === state.activeCorpusId) || corpora[0] || null;
+}
+
+function setActiveCorpus(id) {
+  state.activeCorpusId = Number(id);
+  localStorage.setItem('activeCorpusId', state.activeCorpusId);
+  // Keep the active campaign on this corpus where possible.
+  const inCorpus = corpusProjects();
+  if (!inCorpus.some((p) => p.id === state.activeProjectId)) {
+    state.activeProjectId = inCorpus[0]?.id ?? orgProjects()[0]?.id ?? null;
+    localStorage.setItem('activeProjectId', state.activeProjectId ?? '');
+  }
+}
+
+/** Campaigns operating on the active corpus. */
+function corpusProjects() {
+  const corpus = activeCorpus();
+  return corpus ? orgProjects().filter((p) => p.corpus_id === corpus.id) : orgProjects();
+}
+
 function setActiveOrg(id) {
   state.activeOrgId = Number(id);
   localStorage.setItem('activeOrgId', state.activeOrgId);
-  // Keep the active project inside the organization.
-  const inOrg = orgProjects();
-  if (!inOrg.some((p) => p.id === state.activeProjectId)) {
-    state.activeProjectId = inOrg[0]?.id ?? null;
-    localStorage.setItem('activeProjectId', state.activeProjectId ?? '');
+  // Reset corpus + campaign into the new organization.
+  const corpora = orgCorpora();
+  if (!corpora.some((c) => c.id === state.activeCorpusId)) {
+    setActiveCorpus(corpora[0]?.id ?? null);
+  } else {
+    setActiveCorpus(state.activeCorpusId);
   }
 }
 
 function activeProject() {
   const projects = orgProjects();
-  return projects.find((p) => p.id === state.activeProjectId) || projects[0] || null;
+  return projects.find((p) => p.id === state.activeProjectId) || corpusProjects()[0] || projects[0] || null;
 }
 
 function setActiveProject(id) {
@@ -150,9 +183,15 @@ function isOrgOwner() {
   return (state.me?.orgs ?? []).some((o) => o.role === 'owner_admin');
 }
 
-// Translators get a focused recording-only view of the app.
+// Translators get a focused work-first view of the app. Flat model: the role
+// is organization-wide.
 function isTranslator() {
-  return activeProject()?.role === 'translator';
+  return activeOrg()?.role === 'translator';
+}
+
+// Admin of the ACTIVE organization (drives the Manage section).
+function isActiveOrgAdmin() {
+  return ['owner_admin', 'admin'].includes(activeOrg()?.role);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,61 +373,143 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal
 // Top bar
 // ---------------------------------------------------------------------------
 
-function renderTopbar() {
-  const bar = $('#topbar');
-  if (!state.me) { bar.hidden = true; return; }
-  bar.hidden = false;
-  $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
-  $('#nav-users').hidden = !state.me.user.is_superadmin;
-  $('#nav-orgs').hidden = !state.me.user.is_superadmin;
-  $('#nav-jobs').hidden = !state.me.user.is_superadmin;
-  $('#nav-compensation').hidden = !isOrgAdmin();
-  $('#nav-org').hidden = !isOrgAdmin();
-  // Translators browse the Dictionary and Phrases too (read-only; the server
-  // blocks them from creating/editing entries).
+// ---------------------------------------------------------------------------
+// App shell: compact header + role-aware sidebar (nav spec §4/§5). The
+// sidebar carries the Organization and Collection context; navigation is
+// grouped into Library / Work / Manage / Platform admin.
+// ---------------------------------------------------------------------------
 
-  // Top-left identity: the ORGANIZATION. One org shows its name; several
-  // become a switcher; none (a fresh platform admin) falls back to the brand.
-  const brandEl = $('#org-brand');
+function navLink(href, label) {
+  return `<a href="${href}" data-nav="${href}">${label}</a>`;
+}
+
+function renderShell() {
+  const bar = $('#appbar');
+  const shell = $('#shell');
+  const sidebar = $('#sidebar');
+  if (!state.me) {
+    bar.hidden = true;
+    sidebar.hidden = true;
+    shell.classList.add('no-nav');
+    return;
+  }
+  bar.hidden = false;
+  sidebar.hidden = false;
+  shell.classList.remove('no-nav');
+  $('#user-menu-btn').textContent = `${state.me.user.name} ▾`;
+
   const orgs = state.me.orgs;
   const org = activeOrg();
-  if (orgs.length > 1) {
-    brandEl.innerHTML = `<select id="org-switcher" title="Organization">
-      ${orgs.map((o) => `<option value="${o.id}">${esc(o.name)}</option>`).join('')}
-    </select>`;
-    $('#org-switcher').value = String(org.id);
-    $('#org-switcher').addEventListener('change', (e) => {
-      setActiveOrg(e.target.value);
-      listState.contributor = '';
-      listState.offset = 0;
-      renderTopbar();
-      route();
-    });
+  const corpora = orgCorpora();
+  const corpus = activeCorpus();
+  const translator = isTranslator();
+  const admin = isActiveOrgAdmin();
+
+  const contextHtml = `
+    <div class="nav-context">
+      <label>Organization
+        ${orgs.length > 1
+          ? `<select id="org-switcher">${orgs.map((o) =>
+              `<option value="${o.id}" ${o.id === org?.id ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}</select>`
+          : `<span class="context-fixed">${esc(org?.name ?? 'indigenous.ai')}</span>`}
+      </label>
+      ${corpora.length ? `
+      <label>Collection
+        ${corpora.length > 1
+          ? `<select id="corpus-switcher">${corpora.map((c) =>
+              `<option value="${c.id}" ${c.id === corpus?.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>`
+          : `<span class="context-fixed">${esc(corpus?.name ?? '')}</span>`}
+      </label>` : ''}
+    </div>`;
+
+  const sections = [];
+  sections.push(`<div class="nav-section">${navLink('#/home', 'Home')}</div>`);
+  if (translator) {
+    sections.push(`<div class="nav-section"><h3>Work</h3>
+      ${navLink('#/record', 'Record')}
+      ${navLink('#/translate', 'Translate')}</div>`);
+    sections.push(`<div class="nav-section"><h3>Library</h3>
+      ${navLink('#/entries', 'Entries')}</div>`);
+    sections.push(`<div class="nav-section"><h3>Account</h3>
+      ${navLink('#/earnings', 'Earnings')}</div>`);
   } else {
-    brandEl.textContent = org ? org.name : 'indigenous.ai';
+    sections.push(`<div class="nav-section"><h3>Library</h3>
+      ${navLink('#/entries', 'Entries')}
+      ${navLink('#/recordings', 'Recordings')}
+      ${navLink('#/speakers', 'Speakers')}</div>`);
+    sections.push(`<div class="nav-section"><h3>Work</h3>
+      ${navLink('#/record', 'Record')}
+      ${navLink('#/translate', 'Translate')}
+      ${admin ? navLink('#/projects', 'Projects') : ''}</div>`);
+    if (admin) {
+      sections.push(`<div class="nav-section"><h3>Manage</h3>
+        ${navLink('#/people', 'People')}
+        ${navLink('#/compensation', 'Compensation')}
+        ${navLink('#/consent', 'Consent')}</div>`);
+    }
   }
+  if (state.me.user.is_superadmin) {
+    sections.push(`<div class="nav-section"><h3>Platform admin</h3>
+      ${navLink('#/orgs', 'Organizations')}
+      ${navLink('#/users', 'Users')}
+      ${navLink('#/jobs', 'Service Requests')}</div>`);
+  }
+  sidebar.innerHTML = contextHtml + sections.join('');
 
-  const sw = $('#project-switcher');
-  const projects = orgProjects();
-  sw.innerHTML = projects.length
-    ? projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')
-    : '<option value="">(no projects)</option>';
-  const ap = activeProject();
-  if (ap) sw.value = String(ap.id);
+  $('#org-switcher')?.addEventListener('change', (e) => {
+    setActiveOrg(e.target.value);
+    listState.contributor = '';
+    listState.offset = 0;
+    renderShell();
+    route();
+  });
+  $('#corpus-switcher')?.addEventListener('change', (e) => {
+    setActiveCorpus(e.target.value);
+    listState.contributor = '';
+    listState.offset = 0;
+    renderShell();
+    route();
+  });
+  setActiveNav(location.hash || '#/home');
 }
 
-function setActiveNav(name) {
-  document.querySelectorAll('#topbar nav a').forEach((a) =>
-    a.classList.toggle('active', a.dataset.nav === name));
+// Legacy alias: many views call renderTopbar() after role/context changes.
+const renderTopbar = renderShell;
+
+/** Mark the sidebar link for the current route (aria-current for a11y).
+ *  Accepts a #/hash or a legacy section name from older call sites. */
+function setActiveNav(navHash) {
+  let hash = String(navHash ?? '');
+  if (!hash.startsWith('#')) {
+    const alias = { dashboard: 'home', phrases: 'entries', org: 'people' };
+    hash = '#/' + (alias[hash] || hash);
+  }
+  // Detail routes highlight their section (e.g. #/entries/123 -> #/entries).
+  const base = hash.replace(/^(#\/[a-z-]+).*/, '$1');
+  document.querySelectorAll('#sidebar a').forEach((a) => {
+    if (a.dataset.nav === base || a.dataset.nav === hash) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  });
 }
 
-$('#project-switcher').addEventListener('change', (e) => {
-  setActiveProject(e.target.value);
-  // entry list filters are project-specific — reset them on switch
-  listState.contributor = '';
-  listState.offset = 0;
-  renderTopbar(); // nav differs per role (translator vs member)
-  route(); // re-render current view with new context
+// Mobile drawer: toggle button + backdrop + Escape all close it.
+function closeDrawer() {
+  $('#shell').classList.remove('nav-open');
+  $('#sidebar-backdrop').hidden = true;
+  $('#nav-toggle').setAttribute('aria-expanded', 'false');
+}
+$('#nav-toggle').addEventListener('click', () => {
+  const open = !$('#shell').classList.contains('nav-open');
+  $('#shell').classList.toggle('nav-open', open);
+  $('#sidebar-backdrop').hidden = !open;
+  $('#nav-toggle').setAttribute('aria-expanded', String(open));
+});
+$('#sidebar-backdrop').addEventListener('click', closeDrawer);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('#shell').classList.contains('nav-open')) closeDrawer();
+});
+$('#sidebar').addEventListener('click', (e) => {
+  if (e.target.closest('a')) closeDrawer(); // navigating dismisses the drawer
 });
 
 $('#user-menu-btn').addEventListener('click', () => {
@@ -473,7 +594,6 @@ function showFormError(form, msg) {
 
 function renderLogin() {
   renderTopbar();
-  setActiveNav('');
   view.innerHTML = `
     <div class="login-wrap">
       <div class="brand-big">indigenous.ai</div>
@@ -689,14 +809,13 @@ const jobStatusBadge = (s) =>
                     : '<span class="badge">Awaiting form</span>';
 
 async function renderJobs() {
-  setActiveNav('jobs');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try { data = await api('/requests'); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
   view.innerHTML = `
-    <div class="page-head"><h1>Translation jobs</h1></div>
+    <div class="page-head"><h1>Service Requests</h1></div>
     <div class="card">
       ${data.requests.length ? `
       <div class="table-wrap"><table>
@@ -723,7 +842,6 @@ async function renderJobs() {
 }
 
 async function renderJobDetail(id) {
-  setActiveNav('jobs');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let job;
   try { job = await api(`/requests/${id}`); }
@@ -781,7 +899,6 @@ async function renderJobDetail(id) {
 // ---------------------------------------------------------------------------
 
 async function renderCompensation() {
-  setActiveNav('compensation');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try { data = await api('/compensation'); }
@@ -826,7 +943,6 @@ function workEntryCell(w) {
 }
 
 async function renderCompensationDetail(id) {
-  setActiveNav('compensation');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let d;
   try { d = await api(`/compensation/${id}`); }
@@ -992,32 +1108,38 @@ async function renderCompensationDetail(id) {
 
 const listState = { kind: 'word', q: '', semantic: false, has_audio: '', contributor: '', status: '', incomplete: '', offset: 0 };
 
-async function renderEntries(kind = 'word') {
-  const isPhrase = kind === 'phrase';
-  setActiveNav(isPhrase ? 'phrases' : 'entries');
-  // Switching between Dictionary and Phrases starts with a clean filter set.
+async function renderEntries(kind = '') {
+  // Unified Entries view (nav spec §10): one destination, local tabs
+  // All | Words | Phrases. The content scope is the active COLLECTION.
   if (listState.kind !== kind) {
     Object.assign(listState, { q: '', has_audio: '', contributor: '', status: '', incomplete: '', offset: 0 });
   }
   listState.kind = kind;
+  const isPhrase = kind === 'phrase';
 
-  const projects = state.me.projects;
-  if (!projects.length) {
-    view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
+  const corpus = activeCorpus();
+  if (!corpus) {
+    view.innerHTML = `<div class="empty">You are not part of a collection yet.<br>
       Ask your organization’s administrator to add you.</div>`;
     return;
   }
-  const ap = activeProject();
+  const ap = corpusProjects()[0] ?? activeProject();
 
   view.innerHTML = `
     <div class="page-head">
-      <h1>${isPhrase ? 'Phrases' : 'Dictionary'}</h1>
+      <h1>Entries</h1>
       <div class="head-actions">
-        ${isAdminOf(ap.id) ? `
-          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export?format=csv&kind=${kind}">Export CSV</a>
-          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export?format=json&kind=${kind}">Export JSON</a>
-          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export-bundle?kind=${kind}" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
-        ${isTranslator() ? '' : `<a class="btn" href="#/${isPhrase ? 'phrases' : 'entries'}/new">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>`}
+        ${ap && isAdminOf(ap.id) ? `
+          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export?format=csv${kind ? `&kind=${kind}` : ''}">Export CSV</a>
+          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export?format=json${kind ? `&kind=${kind}` : ''}">Export JSON</a>
+          <a class="btn secondary small" href="/api/language/projects/${ap.id}/export-bundle${kind ? `?kind=${kind}` : ''}" title="Complete archive: entries + master audio + checksums">⬇ Full archive (ZIP)</a>` : ''}
+        ${isTranslator() ? '' : `<a class="btn" href="#/entries/new?kind=${isPhrase ? 'phrase' : 'word'}">＋ New ${isPhrase ? 'phrase' : 'entry'}</a>`}
+      </div>
+    </div>
+    <div style="margin-bottom:0.8rem">
+      <div class="seg-tabs" role="tablist" aria-label="Entry kind">
+        ${[['', 'All'], ['word', 'Words'], ['phrase', 'Phrases']].map(([k, label]) =>
+          `<button role="tab" data-kind="${k}" aria-selected="${k === kind}" class="${k === kind ? 'active' : ''}">${label}</button>`).join('')}
       </div>
     </div>
     <div class="filters">
@@ -1044,8 +1166,11 @@ async function renderEntries(kind = 'word') {
     <div class="entry-list" id="entry-list"><div class="empty">Loading…</div></div>
     <div class="pager" id="pager"></div>`;
 
-  // contributor options come from the active project's stats
+  // contributor options come from the corpus-scoped stats
   populateContributors();
+
+  document.querySelectorAll('.seg-tabs button').forEach((b) =>
+    b.addEventListener('click', () => renderEntries(b.dataset.kind)));
 
   let searchTimer;
   $('#f-q').addEventListener('input', (e) => {
@@ -1063,10 +1188,10 @@ async function renderEntries(kind = 'word') {
 async function populateContributors() {
   const sel = $('#f-contributor');
   if (!sel) return;
-  const pid = activeProject()?.id;
+  const pid = (corpusProjects()[0] ?? activeProject())?.id;
   if (!pid) return;
   try {
-    const stats = await api(`/projects/${pid}/stats?kind=${listState.kind}`);
+    const stats = await api(`/projects/${pid}/stats${listState.kind ? `?kind=${listState.kind}` : ''}`);
     sel.innerHTML = '<option value="">All contributors</option>' +
       stats.contributors.map((c) =>
         `<option value="${c.id}" ${String(c.id) === String(listState.contributor) ? 'selected' : ''}>${esc(c.name)} (${c.entry_count})</option>`).join('');
@@ -1077,9 +1202,11 @@ async function loadEntryList() {
   const listEl = $('#entry-list');
   if (!listEl) return;
   const params = new URLSearchParams();
-  const ap = activeProject();
-  if (ap) params.set('project_id', String(ap.id));
-  params.set('kind', listState.kind);
+  // The Library browses the COLLECTION (corpus), not a campaign.
+  const corpus = activeCorpus();
+  if (corpus) params.set('corpus_id', String(corpus.id));
+  else if (activeProject()) params.set('project_id', String(activeProject().id));
+  if (listState.kind) params.set('kind', listState.kind);
   if (listState.q) params.set('q', listState.q);
   if (listState.semantic && listState.q) params.set('semantic', '1');
   if (listState.has_audio) params.set('has_audio', listState.has_audio);
@@ -1136,21 +1263,26 @@ async function loadEntryList() {
 
 function renderNewEntry(kind = 'word') {
   const isPhrase = kind === 'phrase';
-  const backHref = isPhrase ? '#/phrases' : '#/entries';
-  setActiveNav(isPhrase ? 'phrases' : 'entries');
-  const projects = state.me.projects;
-  if (!projects.length) { location.hash = backHref; return; }
-  const ap = activeProject();
+  const backHref = '#/entries';
+  // Content belongs to the collection; the campaign is only origin/provenance.
+  const campaigns = corpusProjects().filter((p) => p.status !== 'closed');
+  const ap = campaigns.find((p) => p.id === state.activeProjectId) ?? campaigns[0];
+  if (!ap) { location.hash = backHref; return; }
+  const corpus = activeCorpus();
 
   // Every entry — word or phrase — needs at least one side; the other can be
   // filled in later (the entry is flagged as needing translation).
   view.innerHTML = `
     <div class="page-head">
       <h1>New ${isPhrase ? 'phrase' : 'entry'}</h1>
-      <span class="page-context">${esc(ap.name)}${ap.dialect ? ` — ${esc(ap.dialect)}` : ''}</span>
+      <span class="page-context">${esc(corpus?.name ?? ap.name)}</span>
     </div>
     <div class="card">
       <form id="entry-form">
+        ${campaigns.length > 1 ? `
+        <label class="field" style="max-width:340px"><span>Project (which campaign this work belongs to)</span>
+          <select name="project_id">${campaigns.map((p) =>
+            `<option value="${p.id}" ${p.id === ap.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>` : ''}
         <p class="form-hint">Enter the Dene ${isPhrase ? 'phrase' : 'word'}, the English, or both. If you enter only one, it will be queued for translation.</p>
         <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
           <input type="text" name="dene_text" id="dene-input" class="dene" lang="den" spellcheck="false"></label>
@@ -1183,7 +1315,7 @@ function renderNewEntry(kind = 'word') {
       const entry = await api('/entries', {
         method: 'POST',
         body: {
-          project_id: ap.id,
+          project_id: Number(f.project_id?.value ?? ap.id),
           kind,
           dene_text: f.dene_text.value,
           english_text: f.english_text.value,
@@ -1210,9 +1342,9 @@ async function renderEntryDetail(id) {
 
   const isPhrase = entry.kind === 'phrase';
   const incomplete = !entry.dene_text || !entry.english_text;
-  const backHref = isPhrase ? '#/phrases' : '#/entries';
-  const backLabel = isPhrase ? 'phrases' : 'dictionary';
-  setActiveNav(isPhrase ? 'phrases' : 'entries');
+  const backHref = '#/entries';
+  const backLabel = 'entries';
+  setActiveNav('#/entries');
   const ro = !entry.can_edit;
   const isAdmin = entry.role === 'admin';
   const myId = state.me.user.id;
@@ -1234,7 +1366,7 @@ async function renderEntryDetail(id) {
           : '<p class="form-hint">No recordings yet.</p>'}
       </div>
       <p class="form-hint" style="margin-top:0.6rem">Recording happens in your
-        <a href="#/dashboard">recording session</a> — paid work is claimed there.</p>
+        <a href="#/home">recording session</a> — paid work is claimed there.</p>
     </div>` : incomplete ? `
     <div class="card">
       <h2 style="margin-top:0">Recordings</h2>
@@ -1600,7 +1732,6 @@ function audioItemHtml(a, entry) {
 // ---------------------------------------------------------------------------
 
 async function renderTranslatorDashboard() {
-  setActiveNav('dashboard');
   const p = activeProject();
   if (!p) {
     view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
@@ -1645,7 +1776,6 @@ async function renderTranslatorDashboard() {
 
 // A translator's own read-only work log + payments (same data the superadmin sees).
 async function renderMyEarnings() {
-  setActiveNav('dashboard');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let d;
   try { d = await api('/me/compensation'); }
@@ -1655,7 +1785,7 @@ async function renderMyEarnings() {
   view.innerHTML = `
     <div class="page-head">
       <h1>My work &amp; earnings</h1>
-      <a class="btn secondary" href="#/dashboard">‹ Back to dashboard</a>
+      <a class="btn secondary" href="#/home">‹ Back to dashboard</a>
     </div>
     <div class="card">
       <div class="stat-numbers">
@@ -1782,19 +1912,49 @@ function releaseClaims(session) {
   for (const wi of ids) api(`/work/${wi}/release`, { method: 'POST' }).catch(() => {});
 }
 
+/** Work setup (nav spec §12): the campaign funding a session is chosen
+ *  explicitly when the collection has more than one open one. */
+function chooseCampaign(container, expectedHash) {
+  return new Promise((resolve) => {
+    const campaigns = corpusProjects().filter((p) => p.status !== 'closed');
+    if (!campaigns.length) { resolve(null); return; }
+    if (campaigns.length === 1) { setActiveProject(campaigns[0].id); resolve(campaigns[0]); return; }
+    const current = campaigns.find((p) => p.id === state.activeProjectId) ?? campaigns[0];
+    container.innerHTML = `
+      <div class="card preflight">
+        <h2 style="margin-top:0">Project</h2>
+        <p class="preflight-hint">Which project (campaign) is this work session for?</p>
+        <label class="field"><span>Project / campaign</span>
+          <select id="wk-campaign">${campaigns.map((p) =>
+            `<option value="${p.id}" ${p.id === current.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
+        <div class="rec-actions">
+          <button class="secondary" id="wk-cancel">Cancel</button>
+          <button id="wk-start">Continue</button>
+        </div>
+      </div>`;
+    $('#wk-cancel', container).addEventListener('click', () => resolve(null));
+    $('#wk-start', container).addEventListener('click', () => {
+      if (location.hash !== expectedHash) { resolve(null); return; }
+      const id = Number($('#wk-campaign', container).value);
+      setActiveProject(id);
+      resolve(campaigns.find((p) => p.id === id));
+    });
+  });
+}
+
 async function renderRecordSession() {
-  setActiveNav('dashboard');
   endRecSession(); // "Check for more" restarts: close any prior session first
-  const p = activeProject();
-  if (!p) { location.hash = '#/dashboard'; return; }
+  const p = await chooseCampaign(view, '#/record');
+  if (location.hash !== '#/record') return;
+  if (!p) { location.hash = '#/home'; return; }
   // Quick mic check before we start claiming and cycling entries.
   const ok = await micPreflight(view);
   if (location.hash !== '#/record') return; // user navigated away during preflight
-  if (!ok) { location.hash = '#/dashboard'; return; }
+  if (!ok) { location.hash = '#/home'; return; }
   // Session setup (§8): choose the speaker once; every take inherits it.
   const spk = await chooseSpeaker(view, p);
   if (location.hash !== '#/record') return;
-  if (!spk) { location.hash = '#/dashboard'; return; }
+  if (!spk) { location.hash = '#/home'; return; }
   recSession.sessionId = spk.sessionId;
   recSession.speakerName = spk.speakerName;
   view.innerHTML = `<div class="empty">Loading…</div>`;
@@ -1821,7 +1981,7 @@ function renderRecordCard() {
   view.innerHTML = `
     <div class="rec-session">
       <div class="rec-progress">
-        <a href="#/dashboard">‹ Exit</a>
+        <a href="#/home">‹ Exit</a>
         <span>${recSession.pos + 1} of ${recSession.queue.length}${recSession.total > recSession.queue.length ? ` (${recSession.total} waiting in total)` : ''}</span>
         <span>${esc(entry.project_name)}</span>
       </div>
@@ -1856,7 +2016,7 @@ function renderRecordDone() {
         <button id="check-more">Check for more</button>
       </div>
     </div>`;
-  $('#back-dash').addEventListener('click', () => { location.hash = '#/dashboard'; });
+  $('#back-dash').addEventListener('click', () => { location.hash = '#/home'; });
   $('#check-more').addEventListener('click', renderRecordSession);
 }
 
@@ -1955,7 +2115,7 @@ function setupSessionRecorder(entry) {
     after();
   }
 
-  saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/dashboard'; }));
+  saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/home'; }));
   saveNext.addEventListener('click', () => saveThen(() => { recSession.pos++; renderRecordCard(); }));
   skipBtn.addEventListener('click', async () => {
     clearInterval(timer);
@@ -1977,9 +2137,9 @@ function setupSessionRecorder(entry) {
 const transSession = { queue: [], pos: 0, total: 0, claimed: [] };
 
 async function renderTranslateSession() {
-  setActiveNav('dashboard');
-  const p = activeProject();
-  if (!p) { location.hash = '#/dashboard'; return; }
+  const p = await chooseCampaign(view, '#/translate');
+  if (location.hash !== '#/translate') return;
+  if (!p) { location.hash = '#/home'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try {
@@ -2004,7 +2164,7 @@ function renderTranslateCard() {
   view.innerHTML = `
     <div class="rec-session">
       <div class="rec-progress">
-        <a href="#/dashboard">‹ Exit</a>
+        <a href="#/home">‹ Exit</a>
         <span>${transSession.pos + 1} of ${transSession.queue.length}${transSession.total > transSession.queue.length ? ` (${transSession.total} waiting in total)` : ''}</span>
         <span>${esc(entry.project_name)}</span>
       </div>
@@ -2043,7 +2203,7 @@ function renderTranslateDone() {
         <button id="check-more">Check for more</button>
       </div>
     </div>`;
-  $('#back-dash').addEventListener('click', () => { location.hash = '#/dashboard'; });
+  $('#back-dash').addEventListener('click', () => { location.hash = '#/home'; });
   $('#check-more').addEventListener('click', renderTranslateSession);
 }
 
@@ -2078,7 +2238,7 @@ function setupTranslateCard(entry) {
     after();
   }
 
-  saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/dashboard'; }));
+  saveExit.addEventListener('click', () => saveThen(() => { location.hash = '#/home'; }));
   saveNext.addEventListener('click', () => saveThen(() => { transSession.pos++; renderTranslateCard(); }));
   skipBtn.addEventListener('click', () => {
     api(`/work/${entry._wi}/release`, { method: 'POST' }).catch(() => {});
@@ -2094,35 +2254,156 @@ function setupTranslateCard(entry) {
 
 const TARGET_HOURS = 10; // hours of transcribed audio per dialect
 
-async function renderDashboard() {
-  setActiveNav('dashboard');
+// Home (nav spec §9): a collection-oriented overview — counts, recent
+// activity, quick actions. Campaign cards live on the Projects page.
+async function renderHome() {
+  const corpus = activeCorpus();
+  if (!corpus) {
+    view.innerHTML = `<div class="empty">
+      ${isOrgAdmin()
+        ? 'No collection yet — create your first project to start one.<br><br><a class="btn" href="#/projects">Go to Projects</a>'
+        : 'You are not part of a collection yet.<br>Ask your organization’s administrator to add you.'}
+    </div>`;
+    return;
+  }
+  await refreshCorpora();
+  const c = activeCorpus() ?? corpus;
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${esc(c.name)}</h1>
+      <div class="head-actions">
+        ${isTranslator() ? '' : `<a class="btn secondary small" href="#/entries/new?kind=word">＋ Add entry</a>`}
+        <a class="btn small" href="#/record">⏺ Start recording</a>
+      </div>
+    </div>
+    <div class="stat-tiles">
+      <a href="#/entries"><div class="stat-tile"><div class="num">${c.entry_count}</div><div class="lbl">Entries</div></div></a>
+      <a href="#/recordings"><div class="stat-tile"><div class="num">${c.recording_count}</div><div class="lbl">Recordings</div></div></a>
+      <a href="#/recordings"><div class="stat-tile"><div class="num">${fmtHours(c.audio_seconds)}</div><div class="lbl">Audio hours</div></div></a>
+      <a href="#/speakers"><div class="stat-tile"><div class="num">${c.speaker_count}</div><div class="lbl">Speakers</div></div></a>
+    </div>
+    ${isActiveOrgAdmin() ? `
+      <p style="color:var(--muted)">${c.active_project_count} active project${c.active_project_count === 1 ? '' : 's'}
+        · <a href="#/projects">manage projects</a></p>` : ''}
+    <div class="card" id="home-recent"><h2 style="margin-top:0">Recent activity</h2>
+      <div class="empty">Loading…</div></div>`;
+
+  // Recent entries via any campaign on the corpus (stats are corpus-scoped).
+  const anyCampaign = corpusProjects()[0];
+  if (!anyCampaign) { $('#home-recent .empty').textContent = 'No activity yet.'; return; }
+  try {
+    const stats = await api(`/projects/${anyCampaign.id}/stats`);
+    $('#home-recent .empty').outerHTML = stats.recent.length
+      ? `<table style="width:100%"><tbody>${stats.recent.map((r) => `
+          <tr><td><a href="#/entries/${r.id}" class="dene" lang="den">${esc(r.dene_text || '—')}</a></td>
+              <td>${esc(r.english_text || '')}</td>
+              <td style="color:var(--muted);white-space:nowrap">${esc(r.updated_by_name)} · ${fmtDate(r.updated_at)}</td></tr>`).join('')}
+        </tbody></table>`
+      : '<p class="empty">No activity yet.</p>';
+  } catch { $('#home-recent .empty').textContent = 'No activity yet.'; }
+}
+
+// Library: corpus-level recordings browser (nav spec §11).
+async function renderRecordingsLibrary(offset = 0) {
+  const corpus = activeCorpus();
+  if (!corpus) { view.innerHTML = '<div class="empty">No collection selected.</div>'; return; }
+  view.innerHTML = `
+    <div class="page-head"><h1>Recordings</h1>
+      <div class="head-actions"><a class="btn small" href="#/record">⏺ Start recording</a></div></div>
+    <div class="filters">
+      <input type="search" id="rl-q" placeholder="Search entries or speakers…">
+      <select id="rl-lang">
+        <option value="">Language: any</option>
+        <option value="dene">Dene</option>
+        <option value="english">English</option>
+      </select>
+    </div>
+    <div id="rl-list"><div class="empty">Loading…</div></div>
+    <div class="pager" id="rl-pager"></div>`;
+  const load = async (off = 0) => {
+    const q = $('#rl-q').value.trim();
+    const lang = $('#rl-lang').value;
+    let data;
+    try {
+      data = await api(`/recordings?corpus_id=${corpus.id}&limit=50&offset=${off}`
+        + (q ? `&q=${encodeURIComponent(q)}` : '') + (lang ? `&language=${lang}` : ''));
+    } catch (err) { $('#rl-list').innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+    $('#rl-list').innerHTML = data.recordings.length ? `
+      <div class="card"><div class="table-wrap"><table>
+        <thead><tr><th>Entry</th><th>Language</th><th>Speaker</th><th>Length</th><th>Added</th><th>Project</th><th></th></tr></thead>
+        <tbody>${data.recordings.map((r) => `
+          <tr>
+            <td><a href="#/entries/${r.entry_id}" class="dene" lang="den">${esc(r.dene_text || r.english_text || '—')}</a></td>
+            <td>${r.language === 'english' ? 'English' : 'Dene'}</td>
+            <td>${esc(r.speaker_name ?? '—')}</td>
+            <td>${fmtDuration(r.duration_seconds)}</td>
+            <td style="white-space:nowrap">${fmtDate(r.created_at)}</td>
+            <td style="color:var(--muted)">${esc(r.origin_project_name ?? '—')}</td>
+            <td><audio controls preload="none" src="/api/language/audio/${r.id}/stream" style="max-width:220px"></audio></td>
+          </tr>`).join('')}
+        </tbody></table></div></div>`
+      : `<div class="empty">No recordings yet.<br><br><a class="btn" href="#/record">Start recording</a></div>`;
+    const pager = $('#rl-pager');
+    pager.innerHTML = data.total > data.limit ? `
+      <button class="ghost small" id="rl-prev" ${off === 0 ? 'disabled' : ''}>‹ Prev</button>
+      <span>${off + 1}–${Math.min(off + data.limit, data.total)} of ${data.total}</span>
+      <button class="ghost small" id="rl-next" ${off + data.limit >= data.total ? 'disabled' : ''}>Next ›</button>` : '';
+    $('#rl-prev')?.addEventListener('click', () => load(Math.max(0, off - data.limit)));
+    $('#rl-next')?.addEventListener('click', () => load(off + data.limit));
+  };
+  let t;
+  $('#rl-q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => load(0), 250); });
+  $('#rl-lang').addEventListener('change', () => load(0));
+  load(offset);
+}
+
+// Library: speakers (nav spec §11) — first-class page for speaker identity.
+async function renderSpeakersLibrary() {
+  const corpus = activeCorpus();
+  if (!corpus) { view.innerHTML = '<div class="empty">No collection selected.</div>'; return; }
+  view.innerHTML = `<div class="page-head"><h1>Speakers</h1></div><div id="sp-list"><div class="empty">Loading…</div></div>`;
+  let data;
+  try { data = await api(`/speakers?corpus_id=${corpus.id}`); }
+  catch (err) { $('#sp-list').innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  $('#sp-list').innerHTML = data.speakers.length ? `
+    <div class="card"><div class="table-wrap"><table>
+      <thead><tr><th>Speaker</th><th>Account</th><th>Recordings</th><th>Last recording</th><th>Notes</th></tr></thead>
+      <tbody>${data.speakers.map((s) => `
+        <tr>
+          <td><b>${esc(s.display_name)}</b></td>
+          <td>${s.user_id ? esc(s.user_name ?? '') : '<span style="color:var(--muted)">no account</span>'}</td>
+          <td>${s.recording_count}</td>
+          <td style="white-space:nowrap">${s.last_recording_at ? fmtDate(s.last_recording_at) : '—'}</td>
+          <td style="color:var(--muted)">${esc(s.notes ?? '')}</td>
+        </tr>`).join('')}
+      </tbody></table></div></div>
+    <p style="color:var(--muted);font-size:0.9rem">Speakers are registered during recording
+      sessions — a person can be recorded without an account, and linked to one later.</p>`
+    : `<div class="empty">No speakers yet.<br><br>Speakers are registered when a recording
+        session starts — <a href="#/record">start one</a>.</div>`;
+}
+
+async function renderProjects() {
   const isSuper = isOrgAdmin(); // org admins get the rollup + project lifecycle
   view.innerHTML = `<div class="empty">Loading…</div>`;
 
   let data;
   try { data = await api('/projects'); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
-  // The dashboard is scoped to the active organization, like the top bar.
-  const projects = state.activeOrgId
-    ? data.projects.filter((p) => p.organization_id === activeOrg()?.id)
-    : data.projects;
-
-  const totalEntries = projects.reduce((s, p) => s + p.entry_count, 0);
-  const totalSeconds = projects.reduce((s, p) => s + p.audio_seconds, 0);
+  // Work context (nav spec §12): campaigns operating on the ACTIVE collection.
+  const corpus = activeCorpus();
+  const projects = corpus
+    ? data.projects.filter((p) => p.corpus_id === corpus.id)
+    : data.projects.filter((p) => p.organization_id === activeOrg()?.id);
 
   view.innerHTML = `
     <div class="page-head">
-      <h1>Dashboard</h1>
+      <h1>Projects</h1>
       ${isSuper ? '<button id="new-project-btn">＋ New project</button>' : ''}
     </div>
-    ${projects.length > 1 || isSuper ? `
-    <div class="card">
-      <div class="stat-numbers">
-        <div><div class="num">${projects.length}</div><div class="lbl">Projects</div></div>
-        <div><div class="num">${totalEntries}</div><div class="lbl">Entries</div></div>
-        <div><div class="num">${fmtHours(totalSeconds)}</div><div class="lbl">Audio hours</div></div>
-      </div>
-    </div>` : ''}
+    <p style="color:var(--muted);max-width:62ch;margin-top:-0.5rem">Projects are funded
+      campaigns of work on <b>${esc(corpus?.name ?? 'this collection')}</b> — the collection
+      keeps the entries and recordings permanently, whichever campaign contributed them.</p>
     <div class="stat-grid">
       ${projects.map((p) => projectCardHtml(p)).join('') ||
         '<div class="empty">No projects yet.</div>'}
@@ -2176,7 +2457,7 @@ async function showConsentModal(projectId) {
       await api(`/projects/${projectId}/consent-default`, { method: 'PUT', body: { profile_id: v ? Number(v) : null } });
       toast('Default consent profile saved');
       closeModal();
-      loadMe().then(renderDashboard);
+      loadMe().then(renderProjects);
     } catch (err) { toast(err.message, true); }
   });
   $('#bulk-assign-btn')?.addEventListener('click', async (e) => {
@@ -2220,7 +2501,7 @@ function showEditProjectModal(projectId) {
       closeModal();
       toast('Project updated');
       await loadMe();
-      renderDashboard();
+      renderProjects();
     } catch (err) { showFormError(f, err.message); }
   });
 }
@@ -2251,7 +2532,7 @@ function showDeleteProjectModal(projectId, projectName) {
       closeModal();
       toast(`Project deleted (${r.deleted_entries} entries, ${r.deleted_recordings} recordings removed)`);
       await loadMe();
-      renderDashboard();
+      renderProjects();
     } catch (err) { showFormError(f, err.message); }
   });
 }
@@ -2297,7 +2578,7 @@ function showImportModal(projectId, projectName) {
       if (r.skipped_duplicates) parts.push(`${r.skipped_duplicates} duplicates skipped`);
       if (r.skipped_invalid) parts.push(`${r.skipped_invalid} incomplete rows skipped`);
       toast(parts.join(' · '));
-      renderDashboard();
+      renderProjects();
     } catch (err) {
       btn.disabled = false;
       btn.textContent = 'Import';
@@ -2391,7 +2672,7 @@ function showNewProjectModal() {
       closeModal();
       await loadMe();
       toast('Project created');
-      renderDashboard();
+      renderProjects();
     } catch (err) { showFormError(f, err.message); }
   });
 }
@@ -2405,7 +2686,6 @@ function showNewProjectModal() {
 // ---------------------------------------------------------------------------
 
 async function renderOrgsAdmin() {
-  setActiveNav('orgs');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try { data = await api('/admin/orgs'); }
@@ -2518,7 +2798,6 @@ async function renderOrgsAdmin() {
 // ---------------------------------------------------------------------------
 
 async function renderUsers() {
-  setActiveNav('users');
   view.innerHTML = `<div class="empty">Loading…</div>`;
   let data;
   try { data = await api('/users'); }
@@ -2632,142 +2911,136 @@ async function renderUsers() {
 // over the corpus. Platform superadmins have no implicit presence here.
 // ---------------------------------------------------------------------------
 
+// Manage → People (nav spec §13): the active organization's one list.
 async function renderOrganization() {
-  setActiveNav('org');
+  const org = activeOrg();
+  if (!org || !isActiveOrgAdmin()) { location.hash = '#/home'; return; }
   view.innerHTML = `<div class="empty">Loading…</div>`;
-  // Owners AND org admins manage people here (flat model): admins handle
-  // members/translators; owner-only actions are gated per-org below.
-  const owned = (state.me.orgs ?? []).filter((o) => o.role === 'owner_admin' || o.role === 'admin');
-  if (!owned.length) { location.hash = '#/dashboard'; return; }
+  let members;
+  try { members = (await api(`/orgs/${org.id}/members`)).members; }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
-  const sections = [];
-  for (const org of owned) {
+  const roleLabel = { owner_admin: 'Owner', admin: 'Admin', member: 'Member', translator: 'Translator' };
+  view.innerHTML = `
+    <div class="page-head"><h1>People</h1></div>
+    <p style="color:var(--muted);max-width:60ch">One list, four roles — a person's role
+      applies to everything <b>${esc(org.name)}</b> runs. <b>Owners</b> and <b>admins</b>
+      manage people, projects, consent, compensation, and exports; <b>members</b> build the
+      collection; <b>translators</b> work paid recording/translation sessions.</p>
+    <div class="card">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead>
+        <tbody>
+          ${members.map((mb) => `
+            <tr>
+              <td>${esc(mb.name)}</td>
+              <td>${esc(mb.email)}</td>
+              <td>${roleLabel[mb.role] ?? mb.role}</td>
+              <td>${mb.id === state.me.user.id ? '' :
+                `<button class="danger small" data-org-remove="${org.id}" data-user="${mb.id}">Remove</button>`}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table></div>
+      <form class="org-add" data-org="${org.id}" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.8rem">
+        <input type="email" name="email" required placeholder="email" style="flex:1;min-width:200px" aria-label="Email">
+        <input type="text" name="name" placeholder="name (new accounts get an invite email)" style="flex:1;min-width:220px" aria-label="Name">
+        <select name="role" aria-label="Role">
+          <option value="member">Member</option>
+          <option value="translator">Translator</option>
+          ${org.role === 'owner_admin' ? `
+          <option value="admin">Admin</option>
+          <option value="owner_admin">Owner</option>` : ''}
+        </select>
+        <button type="submit">Add / set role</button>
+      </form>
+    </div>`;
+
+  view.onclick = async (e) => {
+    const rm = e.target.closest('button[data-org-remove]');
+    if (!rm) return;
+    if (!confirm('Remove this person from the organization? Their access to all of its projects ends immediately; past contributions keep their attribution.')) return;
     try {
-      const d = await api(`/orgs/${org.id}/members`);
-      sections.push({ org, members: d.members });
-    } catch (err) {
-      sections.push({ org, error: err.message });
-    }
-  }
+      await api(`/orgs/${rm.dataset.orgRemove}/members/${rm.dataset.user}`, { method: 'DELETE' });
+      toast('Removed from organization');
+      renderOrganization();
+    } catch (err) { toast(err.message, true); }
+  };
+  $('form.org-add').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      const r = await api(`/orgs/${f.dataset.org}/members`, {
+        method: 'POST',
+        body: { email: f.email.value.trim(), name: f.name.value.trim() || undefined, role: f.role.value },
+      });
+      if (r.invite_link && !r.invite_sent) {
+        prompt('Added, but the invite email could not be sent.\nCopy this set-password link and share it with them:', r.invite_link);
+      } else {
+        toast(r.invite_sent ? 'Added — invite email sent' : 'Organization role saved');
+      }
+      renderOrganization();
+    } catch (err) { toast(err.message, true); }
+  });
+}
 
-  // Consent profiles per owned org (#6).
-  for (const s of sections) {
-    if (s.error) continue;
-    try { s.profiles = (await api(`/orgs/${s.org.id}/consent-profiles`)).profiles; }
-    catch { s.profiles = []; }
-  }
+// Manage → Consent (nav spec §13): consent-profile administration for the
+// active organization; per-project defaults stay on the Projects page.
+async function renderConsent() {
+  const org = activeOrg();
+  if (!org || !isActiveOrgAdmin()) { location.hash = '#/home'; return; }
+  view.innerHTML = `<div class="empty">Loading…</div>`;
+  let profiles;
+  try { profiles = (await api(`/orgs/${org.id}/consent-profiles`)).profiles; }
+  catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
   const FLAG_LABELS = {
     allow_language_learning: 'Learning', allow_asr_training: 'ASR', allow_tts_training: 'TTS',
     allow_translation_model_training: 'Translation AI', allow_research: 'Research',
     allow_commercial_use: 'Commercial', allow_redistribution: 'Redistribution',
   };
-  const roleLabel = { owner_admin: 'Owner', admin: 'Admin', member: 'Member', translator: 'Translator' };
   view.innerHTML = `
-    <div class="page-head"><h1>Organization</h1></div>
-    <p style="color:var(--muted);max-width:60ch">One list, four roles — a person's role
-      applies to everything the organization runs. <b>Owners</b> and <b>admins</b> manage
-      people, projects, consent, compensation, and exports; <b>members</b> build the
-      corpus; <b>translators</b> work paid recording/translation sessions. Platform
-      administration (accounts, service) is separate and grants no access here.</p>
-    ${sections.map(({ org, members, error }) => `
-      <div class="card">
-        <h2 style="margin-top:0">${esc(org.name)}</h2>
-        ${error ? `<p class="error-msg">${esc(error)}</p>` : `
-        <div class="table-wrap"><table>
-          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead>
-          <tbody>
-            ${members.map((mb) => `
-              <tr>
-                <td>${esc(mb.name)}</td>
-                <td>${esc(mb.email)}</td>
-                <td>${roleLabel[mb.role] ?? mb.role}</td>
-                <td>${mb.id === state.me.user.id ? '' :
-                  `<button class="danger small" data-org-remove="${org.id}" data-user="${mb.id}">Remove</button>`}</td>
-              </tr>`).join('')}
-          </tbody>
-        </table></div>
-        <form class="org-add" data-org="${org.id}" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.8rem">
-          <input type="email" name="email" required placeholder="email" style="flex:1;min-width:200px">
-          <input type="text" name="name" placeholder="name (new accounts get an invite email)" style="flex:1;min-width:220px">
-          <select name="role">
-            <option value="member">Member</option>
-            <option value="translator">Translator</option>
-            ${org.role === 'owner_admin' ? `
-            <option value="admin">Admin</option>
-            <option value="owner_admin">Owner</option>` : ''}
-          </select>
-          <button type="submit">Add / set role</button>
-        </form>
-        <h3 style="margin:1.2rem 0 0.4rem">Consent profiles</h3>
-        <p style="color:var(--muted);font-size:0.85rem;max-width:60ch">Reusable bundles of permitted
-          uses. Recordings keep a snapshot of the profile at assignment time — editing or deleting a
-          profile never changes past consent.</p>
-        ${(sections.find((s) => s.org.id === org.id)?.profiles ?? []).map((p) => `
-          <div class="version-row">
-            <span><b>${esc(p.name)}</b> — ${Object.entries(FLAG_LABELS).filter(([f]) => p[f]).map(([, l]) => l).join(', ') || 'no uses permitted'}</span>
-            <button class="danger small" data-profile-delete="${p.id}">Delete</button>
-          </div>`).join('') || '<p style="color:var(--muted);font-size:0.85rem">No profiles yet.</p>'}
-        <form class="profile-add" data-org="${org.id}" style="margin-top:0.6rem">
-          <input type="text" name="name" required placeholder="profile name, e.g. Education + ASR" style="min-width:240px">
-          <div style="display:flex;gap:0.8rem;flex-wrap:wrap;margin:0.5rem 0">
-            ${Object.entries(FLAG_LABELS).map(([f, l]) =>
-              `<label style="font-size:0.85rem"><input type="checkbox" name="${f}"> ${l}</label>`).join('')}
-          </div>
-          <button type="submit">Create profile</button>
-        </form>`}
-      </div>`).join('')}`;
+    <div class="page-head"><h1>Consent</h1></div>
+    <p style="color:var(--muted);max-width:60ch">Reusable bundles of permitted uses for
+      <b>${esc(org.name)}</b>. Recordings keep a snapshot of the profile at assignment
+      time — editing or deleting a profile never changes past consent. Set each project's
+      default profile from <a href="#/projects">Projects</a> → Consent.</p>
+    <div class="card">
+      ${profiles.map((p) => `
+        <div class="version-row">
+          <span><b>${esc(p.name)}</b> — ${Object.entries(FLAG_LABELS).filter(([f]) => p[f]).map(([, l]) => l).join(', ') || 'no uses permitted'}</span>
+          <button class="danger small" data-profile-delete="${p.id}">Delete</button>
+        </div>`).join('') || '<p style="color:var(--muted);font-size:0.9rem">No profiles yet.</p>'}
+      <form class="profile-add" data-org="${org.id}" style="margin-top:0.8rem">
+        <input type="text" name="name" required placeholder="profile name, e.g. Education + ASR" style="min-width:240px" aria-label="Profile name">
+        <div style="display:flex;gap:0.8rem;flex-wrap:wrap;margin:0.5rem 0">
+          ${Object.entries(FLAG_LABELS).map(([f, l]) =>
+            `<label style="font-size:0.85rem"><input type="checkbox" name="${f}"> ${l}</label>`).join('')}
+        </div>
+        <button type="submit">Create profile</button>
+      </form>
+    </div>`;
 
   view.onclick = async (e) => {
-    const rm = e.target.closest('button[data-org-remove]');
-    if (rm) {
-      if (!confirm('Remove this person from the organization? Their access to all of its projects ends immediately; past contributions keep their attribution.')) return;
-      try {
-        await api(`/orgs/${rm.dataset.orgRemove}/members/${rm.dataset.user}`, { method: 'DELETE' });
-        toast('Removed from organization');
-        renderOrganization();
-      } catch (err) { toast(err.message, true); }
-      return;
-    }
     const pd = e.target.closest('button[data-profile-delete]');
-    if (pd) {
-      if (!confirm('Delete this consent profile? Recordings keep their snapshots; projects using it as a default fall back to consent-unknown.')) return;
-      try {
-        await api(`/consent-profiles/${pd.dataset.profileDelete}`, { method: 'DELETE' });
-        toast('Profile deleted');
-        renderOrganization();
-      } catch (err) { toast(err.message, true); }
-    }
+    if (!pd) return;
+    if (!confirm('Delete this consent profile? Recordings keep their snapshots; projects using it as a default fall back to consent-unknown.')) return;
+    try {
+      await api(`/consent-profiles/${pd.dataset.profileDelete}`, { method: 'DELETE' });
+      toast('Profile deleted');
+      renderConsent();
+    } catch (err) { toast(err.message, true); }
   };
-  for (const f of view.querySelectorAll('form.org-add')) {
-    f.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      try {
-        const r = await api(`/orgs/${f.dataset.org}/members`, {
-          method: 'POST',
-          body: { email: f.email.value.trim(), name: f.name.value.trim() || undefined, role: f.role.value },
-        });
-        if (r.invite_link && !r.invite_sent) {
-          prompt('Added, but the invite email could not be sent.\nCopy this set-password link and share it with them:', r.invite_link);
-        } else {
-          toast(r.invite_sent ? 'Added — invite email sent' : 'Organization role saved');
-        }
-        renderOrganization();
-      } catch (err) { toast(err.message, true); }
-    });
-  }
-  for (const f of view.querySelectorAll('form.profile-add')) {
-    f.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const body = { name: f.name.value.trim() };
-      for (const cb of f.querySelectorAll('input[type=checkbox]')) body[cb.name] = cb.checked;
-      try {
-        await api(`/orgs/${f.dataset.org}/consent-profiles`, { method: 'POST', body });
-        toast('Consent profile created');
-        renderOrganization();
-      } catch (err) { toast(err.message, true); }
-    });
-  }
+  $('form.profile-add').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const body = { name: f.name.value.trim() };
+    for (const cb of f.querySelectorAll('input[type=checkbox]')) body[cb.name] = cb.checked;
+    try {
+      await api(`/orgs/${f.dataset.org}/consent-profiles`, { method: 'POST', body });
+      toast('Consent profile created');
+      renderConsent();
+    } catch (err) { toast(err.message, true); }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2779,10 +3052,23 @@ async function loadMe() {
   if (!state.me.orgs.some((o) => o.id === state.activeOrgId)) {
     state.activeOrgId = state.me.orgs[0]?.id ?? null;
   }
-  if (!orgProjects().some((p) => p.id === state.activeProjectId)) {
-    state.activeProjectId = orgProjects()[0]?.id ?? null;
+  // Collections (corpora) are the Library's content context (nav spec §7).
+  try { state.corpora = (await api('/corpora')).corpora; }
+  catch { state.corpora = []; }
+  if (!orgCorpora().some((c) => c.id === state.activeCorpusId)) {
+    state.activeCorpusId = orgCorpora()[0]?.id ?? null;
   }
-  renderTopbar();
+  if (!orgProjects().some((p) => p.id === state.activeProjectId)) {
+    state.activeProjectId = corpusProjects()[0]?.id ?? orgProjects()[0]?.id ?? null;
+  }
+  renderShell();
+}
+
+/** Refresh corpora counts (after entry/recording changes) without a full reload. */
+async function refreshCorpora() {
+  try {
+    state.corpora = (await api('/corpora')).corpora;
+  } catch { /* keep stale counts */ }
 }
 
 function route() {
@@ -2791,7 +3077,7 @@ function route() {
   releaseClaims(recSession); // return any unfinished claimed work to the queue
   releaseClaims(transSession);
   endRecSession(); // leaving the flow closes the recording session
-  const hash = location.hash || '#/dashboard'; // Dashboard is the home tab
+  let hash = location.hash || '#/home';
   let m;
   // Views that work without a session:
   if ((m = hash.match(/^#\/set-password\/([a-f0-9]{64})$/))) { renderSetPassword(m[1]); return; }
@@ -2799,33 +3085,45 @@ function route() {
   if (hash === '#/request') { renderRequestStart(); return; }
   if ((m = hash.match(/^#\/request\/([a-f0-9]{64})$/))) { renderRequestForm(m[1]); return; }
   if (!state.me) { renderLogin(); return; }
+
+  // Legacy deep links (nav spec §65): keep old bookmarks working.
+  if (hash === '#/dashboard') { location.hash = '#/home'; return; }
+  if (hash === '#/org') { location.hash = isTranslator() ? '#/home' : '#/people'; return; }
+  if (hash === '#/phrases') { listState.kind = 'phrase'; location.hash = '#/entries'; return; }
+  if (hash === '#/phrases/new') { location.hash = '#/entries/new?kind=phrase'; return; }
+
+  setActiveNav(hash);
   if (isTranslator()) {
-    // Translators get their session-focused dashboard plus read-only browsing
-    // of the Dictionary and Phrases (creating/editing stays server-blocked).
-    if (hash === '#/record') renderRecordSession();
+    // Translators keep the focused experience: work sessions, entries
+    // browsing (read-only; server-enforced), and their earnings.
+    if (hash === '#/home') renderTranslatorDashboard();
+    else if (hash === '#/record') renderRecordSession();
     else if (hash === '#/translate') renderTranslateSession();
     else if (hash === '#/earnings') renderMyEarnings();
-    else if (hash === '#/entries') renderEntries('word');
-    else if (hash === '#/phrases') renderEntries('phrase');
+    else if (hash === '#/entries') renderEntries(listState.kind ?? '');
     else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
-    else if (hash === '#/dashboard') renderTranslatorDashboard();
-    else location.hash = '#/dashboard';
+    else location.hash = '#/home';
     return;
   }
-  if (hash === '#/entries') renderEntries('word');
-  else if (hash === '#/entries/new') renderNewEntry('word');
-  else if (hash === '#/phrases') renderEntries('phrase');
-  else if (hash === '#/phrases/new') renderNewEntry('phrase');
+  if (hash === '#/home') renderHome();
+  else if (hash === '#/entries') renderEntries(listState.kind ?? '');
+  else if ((m = hash.match(/^#\/entries\/new(\?kind=(word|phrase))?$/))) renderNewEntry(m[2] || 'word');
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
-  else if (hash === '#/dashboard') renderDashboard();
+  else if (hash === '#/recordings') renderRecordingsLibrary();
+  else if (hash === '#/speakers') renderSpeakersLibrary();
+  else if (hash === '#/record') renderRecordSession();
+  else if (hash === '#/translate') renderTranslateSession();
+  else if (hash === '#/earnings') renderMyEarnings();
+  else if (hash === '#/projects' && isActiveOrgAdmin()) renderProjects();
   else if (hash === '#/users' && state.me.user.is_superadmin) renderUsers();
   else if (hash === '#/orgs' && state.me.user.is_superadmin) renderOrgsAdmin();
   else if (hash === '#/jobs' && state.me.user.is_superadmin) renderJobs();
   else if ((m = hash.match(/^#\/jobs\/(\d+)$/)) && state.me.user.is_superadmin) renderJobDetail(m[1]);
   else if (hash === '#/compensation' && isOrgAdmin()) renderCompensation();
   else if ((m = hash.match(/^#\/compensation\/(\d+)$/)) && isOrgAdmin()) renderCompensationDetail(m[1]);
-  else if (hash === '#/org' && isOrgAdmin()) renderOrganization();
-  else { location.hash = '#/entries'; }
+  else if (hash === '#/people' && isOrgAdmin()) renderOrganization();
+  else if (hash === '#/consent' && isOrgAdmin()) renderConsent();
+  else { location.hash = '#/home'; }
 }
 
 window.addEventListener('hashchange', route);
