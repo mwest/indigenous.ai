@@ -8,35 +8,24 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>🪶</text></svg>">
 </head>
 <body>
-  <header id="topbar" hidden>
-    <div class="brand" id="org-brand"></div>
-    <nav>
-      <a href="#/dashboard" data-nav="dashboard">Dashboard</a>
-      <a href="#/entries" data-nav="entries">Dictionary</a>
-      <a href="#/phrases" data-nav="phrases">Phrases</a>
-      <a href="#/jobs" data-nav="jobs" id="nav-jobs" hidden>Translation Jobs</a>
-      <a href="#/compensation" data-nav="compensation" id="nav-compensation" hidden>Compensation</a>
-      <a href="#/org" data-nav="org" id="nav-org" hidden>Organization</a>
-      <a href="#/orgs" data-nav="orgs" id="nav-orgs" hidden>Organizations</a>
-      <a href="#/users" data-nav="users" id="nav-users" hidden>Users</a>
-    </nav>
-    <div class="topbar-right">
-      <label class="project-switcher" title="Active project for new entries">
-        <span>Project:</span>
-        <select id="project-switcher"></select>
-      </label>
-      <div class="user-menu">
-        <button id="user-menu-btn" class="ghost"></button>
-        <div id="user-menu-dropdown" class="dropdown" hidden>
-          <button id="change-password-btn">Change password</button>
-          <button id="change-name-btn">Change name</button>
-          <button id="logout-btn">Sign out</button>
-        </div>
+  <header id="appbar" hidden>
+    <button id="nav-toggle" class="ghost" aria-expanded="false" aria-controls="sidebar" aria-label="Open menu">☰</button>
+    <div class="brand">indigenous.ai <span class="brand-app">— Language</span></div>
+    <div class="user-menu">
+      <button id="user-menu-btn" class="ghost"></button>
+      <div id="user-menu-dropdown" class="dropdown" hidden>
+        <button id="change-password-btn">Change password</button>
+        <button id="change-name-btn">Change name</button>
+        <button id="logout-btn">Sign out</button>
       </div>
     </div>
   </header>
 
-  <main id="view"></main>
+  <div id="shell" class="no-nav">
+    <nav id="sidebar" aria-label="Main navigation" hidden></nav>
+    <div id="sidebar-backdrop" hidden></div>
+    <main id="view"></main>
+  </div>
 
   <div id="toast" hidden></div>
 

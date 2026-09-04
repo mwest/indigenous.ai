@@ -1627,6 +1627,9 @@ if (BASE.includes('localhost')) {
     check('iso: enabled-org entry detail stays accessible', r.status === 200, r.status);
     r = await iso.req('GET', `/api/entries?project_id=${projB}`);
     check('iso: disabled-org project filter is rejected', r.status === 403, r.status);
+    r = await iso.req('GET', '/api/corpora');
+    check('iso: the collection list excludes disabled orgs',
+      r.data.corpora.every((c) => c.organization_id !== orgB), JSON.stringify(r.data.corpora?.map?.((c) => c.organization_id)));
     r = await iso.req('POST', `/api/projects/${projB}/work/claim`, { type: 'translation', limit: 5 });
     check('iso: disabled-org work claim is 403', r.status === 403, r.status);
     r = await iso.req('POST', `/api/projects/${projA}/work/claim`, { type: 'translation', limit: 5 });
@@ -1677,6 +1680,28 @@ if (BASE.includes('localhost')) {
   r = await sa.req('GET', '/');
   check('signed-in root forwards to /language',
     r.status === 302 && (r.headers.get('location') || '').includes('/language'), r.status);
+}
+
+// --- library APIs (nav spec §7/§11): corpora, recordings, speakers ---
+{
+  r = await sa.req('GET', '/api/corpora');
+  check('corpora endpoint lists visible collections with counts',
+    r.status === 200 && Array.isArray(r.data.corpora) &&
+    r.data.corpora.every((c) => 'entry_count' in c && 'recording_count' in c && 'organization_id' in c),
+    r.status);
+  const c0 = r.data.corpora[0];
+  if (c0) {
+    r = await sa.req('GET', `/api/entries?corpus_id=${c0.id}&limit=5`);
+    check('entries list accepts a corpus scope', r.status === 200, r.status);
+    r = await sa.req('GET', `/api/recordings?corpus_id=${c0.id}&limit=5`);
+    check('corpus recordings browser lists current recordings',
+      r.status === 200 && Array.isArray(r.data.recordings), r.status);
+    r = await sa.req('GET', `/api/speakers?corpus_id=${c0.id}`);
+    check('corpus speakers page lists org speakers with rollups',
+      r.status === 200 && Array.isArray(r.data.speakers), r.status);
+  }
+  r = await sa.req('GET', '/api/recordings?corpus_id=99999999');
+  check('corpus scoping rejects unknown collections', r.status === 403, r.status);
 }
 
 // --- corpus / campaign separation (plan §10) ---
