@@ -241,6 +241,15 @@ const REQUEST_EXTS = new Set([
 const MAX_REQUEST_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_REQUEST_FILES = 5;
 
+// busboy (under multer) decodes multipart filenames as latin1, but browsers
+// send UTF-8 (RFC 7578) — Dene diacritics arrive as mojibake. Recover the
+// UTF-8 name when the bytes round-trip losslessly; ASCII names pass through.
+function utf8UploadName(name) {
+  if (!name || !/[-ÿ]/.test(name)) return name;
+  const decoded = Buffer.from(name, 'latin1').toString('utf8');
+  return Buffer.from(decoded, 'utf8').toString('latin1') === name ? decoded : name;
+}
+
 const requestUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
@@ -296,7 +305,7 @@ language.post('/requests/form/:token', loadRequestByToken, (req, res, next) => {
        VALUES (?, ?, ?, ?, ?)`
     );
     for (const f of req.files ?? []) {
-      ins.run(req.request.id, `${req.request.id}/${f.filename}`, f.originalname,
+      ins.run(req.request.id, `${req.request.id}/${f.filename}`, utf8UploadName(f.originalname),
               f.mimetype || 'application/octet-stream', f.size);
     }
   })();
@@ -979,7 +988,7 @@ language.post('/documents', (req, res) => {
     }
     const result = await documents.createDocument({
       tmpPath: req.file.path,
-      originalName: req.file.originalname,
+      originalName: utf8UploadName(req.file.originalname),
       corpusId: ctx.corpus.id,
       originProjectId,
       title: req.body.title,
@@ -2036,7 +2045,7 @@ function saveMasterRecording({ entry, userId, file, probe, sha256 = null, langua
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
-        uuidv7(), entry.id, storedName, file.originalname, file.mimetype || 'application/octet-stream',
+        uuidv7(), entry.id, storedName, utf8UploadName(file.originalname), file.mimetype || 'application/octet-stream',
         file.size, probe.duration, language, speaker, notes, userId,
         prior?.id ?? null, archiveClass, sha256, probe.sampleRate, probe.channels, probe.bitDepth, probe.codec,
         captureMethod || null, captureDevice || null, speakerId, sessionId
@@ -3123,7 +3132,7 @@ language.post('/projects/:id/import', requireOrgAdminOfProject, (req, res, next)
           .all(project.id, kind))
       .map((e) => JSON.stringify([e.dene_text, e.english_text]))
   );
-  const sourceDoc = `CSV import: ${req.file.originalname}`;
+  const sourceDoc = `CSV import: ${utf8UploadName(req.file.originalname)}`;
   const insert = db.prepare(
     `INSERT INTO entries (uid, project_id, corpus_id, kind, dene_text, english_text, category, source_doc, created_by, updated_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
