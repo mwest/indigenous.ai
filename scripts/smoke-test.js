@@ -1811,6 +1811,14 @@ if (BASE.includes('localhost')) {
   const evilDoc = r.data;
   await waitReady(evilDoc.id);
 
+  // UTF-8 filenames survive multipart (busboy decodes them as latin1).
+  r = await upload('sǫǫ̀mbaà-notes.txt', Buffer.from('notes about money words\n'));
+  check('doc: Dene diacritics in filenames survive upload',
+    r.status === 201 && r.data.original_filename === 'sǫǫ̀mbaà-notes.txt' && r.data.title === 'sǫǫ̀mbaà-notes.txt',
+    JSON.stringify(r.data.original_filename));
+  const deneDoc = r.data;
+  await waitReady(deneDoc.id);
+
   // Original bytes served only through the authorized endpoint.
   const orig = await sa.raw('GET', `/api/documents/${txtDoc.id}/original`);
   check('doc: original downloads as an attachment with exact bytes',
@@ -1865,7 +1873,7 @@ if (BASE.includes('localhost')) {
     (await sa.req('GET', `/api/documents/${evilDoc.id}`)).status === 404);
 
   // cleanup: delete documents then the project (sole campaign takes the corpus).
-  for (const d of [txtDoc, csvDoc, xlsxDoc, docxDoc, pdfDoc]) {
+  for (const d of [txtDoc, csvDoc, xlsxDoc, docxDoc, pdfDoc, deneDoc]) {
     await sa.req('DELETE', `/api/documents/${d.id}`, { confirm_title: d.title });
   }
   await sa.req('DELETE', `/api/projects/${docProj.id}`, { confirm_name: docProjName });
