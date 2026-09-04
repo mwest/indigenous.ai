@@ -1,7 +1,7 @@
 {
   "name": "indigenous-ai",
   "version": "1.0.0",
-  "description": "Indigenous.ai — a platform for Indigenous governments. Language is the first application.",
+  "description": "Indigenous.ai \u00e2\u20ac\u201d a platform for Indigenous governments. Language is the first application.",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -9,7 +9,8 @@
     "create-superadmin": "node scripts/create-superadmin.js",
     "test": "node scripts/run-tests.js",
     "test:migrations": "node scripts/migration-test.js",
-    "migrations:status": "node scripts/migration-status.js"
+    "migrations:status": "node scripts/migration-status.js",
+    "documents:reindex": "node scripts/documents-reindex.js"
   },
   "license": "UNLICENSED",
   "dependencies": {
@@ -18,8 +19,11 @@
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.10.0",
     "cookie-parser": "^1.4.7",
+    "exceljs": "^4.4.0",
     "express": "^5.2.1",
+    "mammoth": "^1.12.2",
     "multer": "^2.1.1",
-    "music-metadata": "^11.13.0"
+    "music-metadata": "^11.13.0",
+    "pdfjs-dist": "^6.3.289"
   }
 }

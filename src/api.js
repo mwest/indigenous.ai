@@ -9,6 +9,9 @@ import db, { AUDIO_DIR, REQUESTS_DIR, roleIn, projectsFor, projectIdsFor, orgRol
 import { embed, toBlob, fromBlob, cosine, MODEL } from './embed.js';
 import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, classifyArchive } from './audio.js';
 import { syncEntryTexts, varietyForDialect } from './apps/language/texts.js';
+import { parseCsv } from './apps/language/csv.js';
+import * as documents from './apps/language/documents/service.js';
+import { DOCUMENTS_DIR } from './apps/language/documents/storage.js';
 import { selfSpeakerFor, orgOfProject } from './apps/language/speakers.js';
 import { organizationHasApp, entitledOrgIds } from './platform/entitlements.js';
 import { uuidv7 } from './platform/uid.js';
@@ -886,6 +889,164 @@ language.get('/speakers', (req, res) => {
     )
     .all(orgId);
   res.json({ speakers });
+});
+
+// ---------------------------------------------------------------------------
+// Documents (documents spec) — corpus-owned source materials. Routes stay
+// thin here (authorization needs this file's helpers); all data behavior
+// lives in src/apps/language/documents/. Policy (spec §37): browse/search/
+// download for members and admins of the corpus's org; upload for members+;
+// reprocess/archive/delete for admins. Translators have no document access
+// in v1 — documents may hold sensitive material, and their focused workflow
+// doesn't need them.
+// ---------------------------------------------------------------------------
+
+/** The user's role on a corpus (flat model: the org role, admin-collapsed). */
+function roleForCorpus(user, corpusId) {
+  const corpus = db.prepare('SELECT organization_id FROM corpora WHERE id = ?').get(corpusId);
+  if (!corpus) return null;
+  const role = orgRole(user, corpus.organization_id);
+  if (!role) return null;
+  return role === 'owner_admin' || role === 'admin' ? 'admin' : role;
+}
+
+/** Corpus-level document authorization: entitlement + browse role. */
+function requireDocumentCorpus(req, res, corpusId, { manage = false, upload = false } = {}) {
+  const corpus = db.prepare('SELECT * FROM corpora WHERE id = ?').get(Number(corpusId) || 0);
+  if (!corpus) { bad(res, 'Collection not found', 404); return null; }
+  if (!requireLanguageForOrg(res, corpus.organization_id)) return null;
+  const role = roleForCorpus(req.user, corpus.id);
+  if (!role || role === 'translator') { bad(res, 'No document access in this collection', 403); return null; }
+  if ((manage && role !== 'admin')) { bad(res, 'Admin access required', 403); return null; }
+  if (upload && !['admin', 'member'].includes(role)) { bad(res, 'No upload access', 403); return null; }
+  return { corpus, role };
+}
+
+function loadDocument(opts = {}) {
+  return (req, res, next) => {
+    const doc = documents.documentById(Number(req.params.id));
+    if (!doc) return bad(res, 'Document not found', 404);
+    const ctx = requireDocumentCorpus(req, res, doc.corpus_id, opts);
+    if (!ctx) return;
+    req.document = doc;
+    req.docRole = ctx.role;
+    next();
+  };
+}
+
+const documentUpload = multer({
+  dest: path.join(DOCUMENTS_DIR, 'tmp'),
+  limits: { fileSize: documents.MAX_UPLOAD_BYTES },
+}).single('file');
+
+language.get('/documents', (req, res) => {
+  if (!requireDocumentCorpus(req, res, req.query.corpus_id)) return;
+  res.json(documents.listDocuments({
+    corpusId: Number(req.query.corpus_id),
+    q: String(req.query.q ?? '').trim() || null,
+    status: String(req.query.status ?? '') || null,
+    type: String(req.query.type ?? '') || null,
+    limit: Math.min(Number(req.query.limit) || 50, 200),
+    offset: Math.max(Number(req.query.offset) || 0, 0),
+  }));
+});
+
+language.get('/documents/search', (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  if (!q) return bad(res, 'A search query is required');
+  if (!requireDocumentCorpus(req, res, req.query.corpus_id)) return;
+  res.json({
+    results: documents.searchBlocks({
+      q, corpusId: Number(req.query.corpus_id),
+      limit: Math.min(Number(req.query.limit) || 25, 100),
+      offset: Math.max(Number(req.query.offset) || 0, 0),
+    }),
+  });
+});
+
+language.post('/documents', (req, res) => {
+  documentUpload(req, res, async (err) => {
+    if (err) return bad(res, err.code === 'LIMIT_FILE_SIZE'
+      ? `File too large (max ${Math.round(documents.MAX_UPLOAD_BYTES / 1024 / 1024)} MB)` : err.message);
+    if (!req.file) return bad(res, 'No file provided');
+    const ctx = requireDocumentCorpus(req, res, req.body.corpus_id, { upload: true });
+    if (!ctx) { fs.rm(req.file.path, { force: true }, () => {}); return; }
+    let originProjectId = req.body.origin_project_id ? Number(req.body.origin_project_id) : null;
+    if (originProjectId) {
+      const p = db.prepare('SELECT corpus_id FROM projects WHERE id = ?').get(originProjectId);
+      if (!p || p.corpus_id !== ctx.corpus.id) originProjectId = null; // provenance only — never trust blindly
+    }
+    const result = await documents.createDocument({
+      tmpPath: req.file.path,
+      originalName: req.file.originalname,
+      corpusId: ctx.corpus.id,
+      originProjectId,
+      title: req.body.title,
+      userId: req.user.id,
+    });
+    if (result.error) {
+      return res.status(result.status ?? 400)
+        .json({ error: result.error, ...(result.existing ? { existing: result.existing } : {}) });
+    }
+    res.status(201).json(result.document);
+  });
+});
+
+language.get('/documents/:id', loadDocument(), (req, res) => {
+  res.json(documents.documentDetail(req.document, req.docRole === 'admin'));
+});
+
+language.get('/documents/:id/blocks', loadDocument(), (req, res) => {
+  res.json(documents.listBlocks({
+    documentId: req.document.id,
+    page: req.query.page, sheet: req.query.sheet,
+    limit: Math.min(Number(req.query.limit) || 100, 500),
+    offset: Math.max(Number(req.query.offset) || 0, 0),
+  }));
+});
+
+language.get('/documents/:id/search', loadDocument(), (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  if (!q) return bad(res, 'A search query is required');
+  res.json({ results: documents.searchBlocks({ q, documentId: req.document.id, limit: 50 }) });
+});
+
+// Original download (spec §36/§77): served only through this authorized
+// endpoint — storage paths are never exposed as static URLs.
+language.get('/documents/:id/original', loadDocument(), (req, res) => {
+  const version = documents.currentVersion(req.document.id);
+  if (!version) return bad(res, 'No stored file', 404);
+  res.sendFile(documents.absolutePath(version.storage_key), {
+    headers: {
+      'Content-Type': req.document.mime_type,
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(version.original_filename)}`,
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+});
+
+language.post('/documents/:id/reprocess', loadDocument({ manage: true }), (req, res) => {
+  if (!documents.reprocessDocument(req.document.id)) return bad(res, 'No stored version to reprocess', 409);
+  res.json({ ok: true, status: 'uploaded' });
+});
+
+language.post('/documents/:id/archive', loadDocument({ manage: true }), (req, res) => {
+  documents.setArchived(req.document.id, true);
+  res.json({ ok: true, status: 'archived' });
+});
+
+language.post('/documents/:id/restore', loadDocument({ manage: true }), (req, res) => {
+  documents.setArchived(req.document.id, false);
+  res.json({ ok: true, status: 'ready' });
+});
+
+language.delete('/documents/:id', loadDocument({ manage: true }), (req, res) => {
+  if (req.body?.confirm_title !== req.document.title) {
+    return bad(res, 'Type the exact document title to confirm deletion');
+  }
+  const result = documents.deleteDocument(req.document.id);
+  if (result.error) return bad(res, result.error, 409);
+  res.json({ ok: true });
 });
 
 language.get('/projects', (req, res) => {
@@ -2799,26 +2960,6 @@ language.get('/projects/:id/export-bundle', requireProjectAdmin, async (req, res
 // ---------------------------------------------------------------------------
 
 // Minimal RFC 4180 parser: quoted fields, escaped quotes, CRLF.
-function parseCsv(text) {
-  const rows = [];
-  let row = [];
-  let field = '';
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (text[i + 1] === '"') { field += '"'; i++; }
-        else inQuotes = false;
-      } else field += c;
-    } else if (c === '"') inQuotes = true;
-    else if (c === ',') { row.push(field); field = ''; }
-    else if (c === '\n') { row.push(field); field = ''; rows.push(row); row = []; }
-    else if (c !== '\r') field += c;
-  }
-  if (field !== '' || row.length) { row.push(field); rows.push(row); }
-  return rows;
-}
 
 const csvUpload = multer({
   storage: multer.memoryStorage(),

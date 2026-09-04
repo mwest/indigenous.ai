@@ -8,6 +8,7 @@ import { COOKIE_NAME, userForToken } from './src/auth.js';
 import { APP_URL } from './src/mail.js';
 import { backfillEmbeddings } from './scripts/embed-backfill.js';
 import { backfillAudio } from './scripts/audio-backfill.js';
+import { startDocumentWorker } from './src/apps/language/documents/worker.js';
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(import.meta.dirname, 'public');
@@ -95,4 +96,6 @@ app.listen(PORT, () => {
   // derivatives (idempotent; no-ops once caught up). Best-effort, non-blocking.
   backfillAudio((m) => console.log(`[audio] ${m}`))
     .catch((e) => console.error('[audio] backfill failed:', e.message));
+  // Document ingestion: DB-backed queue, claimed by an in-process worker.
+  startDocumentWorker();
 });
