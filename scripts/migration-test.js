@@ -40,9 +40,10 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 6 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied.length === 7 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
     applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids' &&
-    applied[4].name === '005_corpora' && applied[5].name === '006_flat_roles',
+    applied[4].name === '005_corpora' && applied[5].name === '006_flat_roles' &&
+    applied[6].name === '007_documents',
     JSON.stringify(applied));
   check('fresh: organization_memberships allows the translator role',
     tableSql(db, 'organization_memberships').includes('translator'));
@@ -53,7 +54,9 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map((t) => t.name);
   for (const t of ['users', 'organizations', 'organization_apps', 'work_items', 'work_log', 'audio_files',
                    'languages', 'language_varieties', 'orthographies', 'entry_texts',
-                   'speakers', 'recording_sessions', 'corpora']) {
+                   'speakers', 'recording_sessions', 'corpora',
+                   'documents', 'document_versions', 'document_blocks', 'ingestion_jobs',
+                   'entry_document_sources']) {
     check(`fresh: table ${t} exists`, tables.includes(t));
   }
   check('fresh: English and Dene languages seeded',
@@ -61,6 +64,9 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   check('fresh: English variety seeded with a uid',
     !!db.prepare(`SELECT 1 FROM language_varieties v JOIN languages l ON l.id=v.language_id
                   WHERE l.code='en' AND v.uid IS NOT NULL`).get());
+  check('fresh: document FTS is configured to preserve diacritics',
+    (db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'document_blocks_fts'`).get()?.sql ?? '')
+      .includes('remove_diacritics 0'));
   check('fresh: foreign_key_check clean', db.pragma('foreign_key_check').length === 0);
   db.close();
 }
@@ -131,7 +137,9 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
   check('legacy: all migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 6);
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 7);
+  check('legacy: documents tables exist after upgrade',
+    !!tableSql(db, 'documents') && !!tableSql(db, 'ingestion_jobs'));
   // 006: project roles flatten into org roles — the superadmin's owner grant
   // (001) is never downgraded; the plain member's project role becomes an org
   // role; the legacy memberships table survives as provenance.

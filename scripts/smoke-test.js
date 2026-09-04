@@ -76,6 +76,54 @@ function makeMp3(frames = 40) {
   return buf;
 }
 
+
+// Minimal DOCX (OOXML zip) fixture — heading + two paragraphs, with diacritics.
+async function makeDocx() {
+  const { createRequire } = await import('node:module');
+  const archiver = createRequire(import.meta.url)('archiver');
+  const docXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Traditional Foods</w:t></w:r></w:p>
+<w:p><w:r><w:t>Dene people harvest łue from the lake.</w:t></w:r></w:p>
+<w:p><w:r><w:t>Second paragraph with sǫǫ̀mbaà.</w:t></w:r></w:p>
+</w:body></w:document>`;
+  const chunks = [];
+  const zip = archiver('zip');
+  zip.on('data', (c) => chunks.push(c));
+  const done = new Promise((res, rej) => { zip.on('end', res); zip.on('error', rej); });
+  zip.append(`<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`, { name: '[Content_Types].xml' });
+  zip.append(`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`, { name: '_rels/.rels' });
+  zip.append(docXml, { name: 'word/document.xml' });
+  zip.finalize();
+  await done;
+  return Buffer.concat(chunks);
+}
+
+// Minimal valid one-page text PDF with computed xref offsets.
+function makePdfFixture(text) {
+  const escd = text.replace(/([()\\\\])/g, '\\$1');
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    null,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  const stream = `BT /F1 12 Tf 72 720 Td (${escd}) Tj ET`;
+  objs[3] = `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objs.forEach((o, i) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${i + 1} 0 obj\n${o}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` +
+    offsets.map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('') +
+    `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf, 'utf8');
+}
+
 const sa = client();
 const member = client();
 const stranger = client();
@@ -1669,6 +1717,160 @@ if (BASE.includes('localhost')) {
   } catch (e) {
     check('entitlement-isolation block ran', false, e.stack || e.message);
   }
+}
+
+// --- documents (documents spec phases B+C) ---
+{
+  const ts = Date.now();
+  const docProjName = `Docs ${ts}`;
+  r = await sa.req('POST', '/api/projects', { name: docProjName, dialect: 'Dëne Sųłıné' });
+  const docProj = r.data;
+  const corpusId = docProj.corpus_id;
+
+  const upload = async (name, buf, extra = {}) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([buf]), name);
+    fd.append('corpus_id', String(corpusId));
+    for (const [k, v] of Object.entries(extra)) fd.append(k, v);
+    return sa.req('POST', '/api/documents', fd, true);
+  };
+  const waitReady = async (id) => {
+    for (let i = 0; i < 80; i++) {
+      const d = (await sa.req('GET', `/api/documents/${id}`)).data;
+      if (['ready', 'failed'].includes(d.status)) return d;
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return (await sa.req('GET', `/api/documents/${id}`)).data;
+  };
+
+  // TXT with Indigenous orthography.
+  const txtBytes = Buffer.from('ʔerıhtł’é means paper.\n\nsǫǫ̀mbaà means money.\n');
+  r = await upload('field-notes.txt', txtBytes);
+  check('doc: TXT upload accepted (returns before extraction)', r.status === 201 && r.data.status === 'uploaded', JSON.stringify(r.data));
+  const txtDoc = await waitReady(r.data.id);
+  check('doc: TXT reaches ready through extract/index', txtDoc.status === 'ready', `${txtDoc.status} ${txtDoc.error_message ?? ''}`);
+  r = await sa.req('GET', `/api/documents/${txtDoc.id}/blocks`);
+  check('doc: TXT paragraphs preserved with line locators',
+    r.data.total === 2 && r.data.blocks[0].block_type === 'paragraph' && r.data.blocks[0].text.includes('ʔerıhtł’é'),
+    JSON.stringify(r.data.total));
+
+  r = await sa.req('GET', `/api/documents/search?corpus_id=${corpusId}&q=${encodeURIComponent('sǫǫ̀mbaà')}`);
+  check('doc: search finds the exact Indigenous orthography',
+    r.data.results.length >= 1 && r.data.results[0].document_id === txtDoc.id, JSON.stringify(r.data.results?.length));
+  r = await sa.req('GET', `/api/documents/search?corpus_id=${corpusId}&q=soombaa`);
+  check('doc: diacritics are never silently stripped from the index', r.data.results.length === 0, r.data.results?.length);
+
+  // CSV with quoted fields.
+  r = await upload('wordlist.csv', Buffer.from('English,Dene,Category\nfish,"łue",animals\n"has, comma","ʔah",tools\n'));
+  const csvDoc = await waitReady(r.data.id);
+  check('doc: CSV reaches ready', csvDoc.status === 'ready', csvDoc.error_message ?? csvDoc.status);
+  r = await sa.req('GET', `/api/documents/${csvDoc.id}/blocks`);
+  check('doc: CSV rows keep row numbers and header-keyed cells',
+    r.data.blocks[0]?.row_number === 2 && JSON.parse(r.data.blocks[0].metadata_json).cells.Dene === 'łue',
+    JSON.stringify(r.data.blocks[0]));
+
+  // XLSX with two sheets.
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  const s1 = wb.addWorksheet('Dictionary'); s1.addRow(['English', 'Dene']); s1.addRow(['water', 'tu']);
+  const s2 = wb.addWorksheet('Phrases'); s2.addRow(['English', 'Dene']); s2.addRow(['thank you', 'mahsi cho']);
+  r = await upload('workbook.xlsx', Buffer.from(await wb.xlsx.writeBuffer()));
+  const xlsxDoc = await waitReady(r.data.id);
+  check('doc: XLSX reaches ready', xlsxDoc.status === 'ready', xlsxDoc.error_message ?? xlsxDoc.status);
+  r = await sa.req('GET', `/api/documents/${xlsxDoc.id}/blocks?sheet=Phrases`);
+  check('doc: XLSX sheet filter with sheet/row provenance',
+    r.data.total === 1 && r.data.blocks[0].sheet_name === 'Phrases' && r.data.blocks[0].row_number === 2,
+    JSON.stringify(r.data.blocks?.[0]));
+
+  // DOCX: heading + paragraphs, order preserved.
+  r = await upload('story.docx', await makeDocx());
+  const docxDoc = await waitReady(r.data.id);
+  check('doc: DOCX reaches ready with ordered blocks',
+    docxDoc.status === 'ready' && docxDoc.block_count === 3, `${docxDoc.status} blocks=${docxDoc.block_count}`);
+  r = await sa.req('GET', `/api/documents/${docxDoc.id}/blocks`);
+  check('doc: DOCX heading detected first', r.data.blocks[0]?.block_type === 'heading');
+
+  // PDF: native text with page provenance.
+  r = await upload('report.pdf', makePdfFixture('The lake holds many fish for the people.'));
+  const pdfDoc = await waitReady(r.data.id);
+  check('doc: PDF reaches ready', pdfDoc.status === 'ready', pdfDoc.error_message ?? pdfDoc.status);
+  r = await sa.req('GET', `/api/documents/${pdfDoc.id}/search?q=lake`);
+  check('doc: in-document search returns page provenance', r.data.results[0]?.page_number === 1, JSON.stringify(r.data.results?.[0]));
+
+  // Duplicate bytes in the same collection -> 409 with a pointer.
+  r = await upload('field-notes-copy.txt', txtBytes);
+  check('doc: exact duplicate rejected with the existing document', r.status === 409 && r.data.existing?.id === txtDoc.id, r.status);
+
+  // Format security.
+  r = await upload('macro.docm', Buffer.from('PK fake'));
+  check('doc: unsupported/macro-enabled formats rejected', r.status === 400, r.status);
+  r = await upload('fake.pdf', Buffer.from('this is not a pdf'));
+  check('doc: extension/signature mismatch rejected', r.status === 400, r.status);
+  r = await upload('..\\..\\evil.txt', Buffer.from('plain text content here'));
+  check('doc: path-traversal filename sanitized', r.status === 201 && !/[\\/]/.test(r.data.original_filename), JSON.stringify(r.data.original_filename));
+  const evilDoc = r.data;
+  await waitReady(evilDoc.id);
+
+  // Original bytes served only through the authorized endpoint.
+  const orig = await sa.raw('GET', `/api/documents/${txtDoc.id}/original`);
+  check('doc: original downloads as an attachment with exact bytes',
+    orig.status === 200 && orig.buf.equals(txtBytes) && /attachment/.test(orig.headers.get('content-disposition') ?? ''),
+    orig.status);
+
+  // Authorization: translators and outsiders have no document access.
+  const trEmail = `doctr-${ts}@test.ca`;
+  await sa.req('POST', `/api/projects/${docProj.id}/members`, { email: trEmail, name: 'Doc Translator', password: 'doctr-pass-1', role: 'translator' });
+  const dtr = client();
+  await dtr.req('POST', '/api/login', { email: trEmail, password: 'doctr-pass-1' });
+  r = await dtr.req('GET', `/api/documents?corpus_id=${corpusId}`);
+  check('doc: translators cannot browse documents (v1 policy)', r.status === 403, r.status);
+  r = await dtr.req('GET', `/api/documents/${txtDoc.id}/original`);
+  check('doc: translators cannot download originals', r.status === 403, r.status);
+  const outEmail = `docout-${ts}@test.ca`;
+  r = await sa.req('POST', '/api/users', { email: outEmail, name: 'Doc Outsider', password: 'docout-pass-1' });
+  const outId = r.data.user_id ?? r.data.id;
+  const dout = client();
+  await dout.req('POST', '/api/login', { email: outEmail, password: 'docout-pass-1' });
+  r = await dout.req('GET', `/api/documents/${txtDoc.id}`);
+  check('doc: a guessed document id never crosses org boundaries', r.status === 403, r.status);
+  r = await dtr.req('POST', `/api/documents/${txtDoc.id}/reprocess`);
+  check('doc: management endpoints are admin-only', r.status === 403, r.status);
+
+  // Reprocess: derived data rebuilt, original untouched.
+  const shaBefore = txtDoc.sha256;
+  r = await sa.req('POST', `/api/documents/${txtDoc.id}/reprocess`);
+  check('doc: admin can reprocess', r.status === 200, r.status);
+  const reDoc = await waitReady(txtDoc.id);
+  check('doc: reprocess keeps the checksum and rebuilds blocks',
+    reDoc.status === 'ready' && reDoc.sha256 === shaBefore && reDoc.block_count === 2,
+    JSON.stringify({ s: reDoc.status, b: reDoc.block_count }));
+  r = await sa.req('GET', `/api/documents/search?corpus_id=${corpusId}&q=${encodeURIComponent('sǫǫ̀mbaà')}`);
+  check('doc: search works after reprocess (index rebuilt)', r.data.results.length >= 1, r.data.results?.length);
+
+  // Archive hides from default browse; restore brings it back.
+  await sa.req('POST', `/api/documents/${csvDoc.id}/archive`);
+  r = await sa.req('GET', `/api/documents?corpus_id=${corpusId}`);
+  check('doc: archived documents leave default browse', !r.data.documents.some((d) => d.id === csvDoc.id));
+  r = await sa.req('GET', `/api/documents/search?corpus_id=${corpusId}&q=${encodeURIComponent('łue')}`);
+  check('doc: archived documents leave search too', !r.data.results.some((x) => x.document_id === csvDoc.id));
+  await sa.req('POST', `/api/documents/${csvDoc.id}/restore`);
+  r = await sa.req('GET', `/api/documents?corpus_id=${corpusId}`);
+  check('doc: restore returns the document', r.data.documents.some((d) => d.id === csvDoc.id));
+
+  // Delete: exact-title confirmation, admin-only.
+  r = await sa.req('DELETE', `/api/documents/${evilDoc.id}`, { confirm_title: 'wrong' });
+  check('doc: delete requires the exact title', r.status === 400, r.status);
+  r = await sa.req('DELETE', `/api/documents/${evilDoc.id}`, { confirm_title: evilDoc.title });
+  check('doc: confirmed delete removes the document', r.status === 200 &&
+    (await sa.req('GET', `/api/documents/${evilDoc.id}`)).status === 404);
+
+  // cleanup: delete documents then the project (sole campaign takes the corpus).
+  for (const d of [txtDoc, csvDoc, xlsxDoc, docxDoc, pdfDoc]) {
+    await sa.req('DELETE', `/api/documents/${d.id}`, { confirm_title: d.title });
+  }
+  await sa.req('DELETE', `/api/projects/${docProj.id}`, { confirm_name: docProjName });
+  r = await sa.req('DELETE', `/api/users/${outId}`);
+  check('doc: cleanup complete', r.status === 200, JSON.stringify(r.data));
 }
 
 // --- root sign-in page ---
