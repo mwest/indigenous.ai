@@ -11,6 +11,7 @@ import { MASTERS_DIR, DERIVED_DIR, probeAudio, enqueueDerivative, sha256File, cl
 import { syncEntryTexts, varietyForDialect } from './apps/language/texts.js';
 import { parseCsv } from './apps/language/csv.js';
 import * as documents from './apps/language/documents/service.js';
+import { masterSearch, homeFeed } from './apps/language/search/service.js';
 import { DOCUMENTS_DIR } from './apps/language/documents/storage.js';
 import { selfSpeakerFor, orgOfProject } from './apps/language/speakers.js';
 import { organizationHasApp, entitledOrgIds } from './platform/entitlements.js';
@@ -844,6 +845,37 @@ function visibleCorpusIds(user) {
     .all(...orgIds);
   return new Set(rows.map((r) => r.id));
 }
+
+// ---------------------------------------------------------------------------
+// Master search + Home feed (master-search spec): users search the active
+// Collection, not tables. Authorization resolves corpus -> org -> entitlement
+// -> membership BEFORE any retrieval (visibleCorpusIds covers all three), and
+// translators get no documents section at all — not even a count (spec §33).
+// ---------------------------------------------------------------------------
+function requireSearchCorpus(req, res) {
+  const corpusId = Number(req.query.corpus_id || 0);
+  if (!corpusId || !visibleCorpusIds(req.user).has(corpusId)) {
+    bad(res, 'Not a member of this collection', 403);
+    return null;
+  }
+  return { corpusId, includeDocuments: roleForCorpus(req.user, corpusId) !== 'translator' };
+}
+
+language.get('/search', async (req, res) => {
+  const scope = requireSearchCorpus(req, res);
+  if (!scope) return;
+  const q = String(req.query.q ?? '').trim();
+  if (!q) return bad(res, 'q is required');
+  const limit = Math.min(Number(req.query.limit) || 5, 20);
+  res.json(await masterSearch({ corpusId: scope.corpusId, q, limit, includeDocuments: scope.includeDocuments }));
+});
+
+language.get('/home', (req, res) => {
+  const scope = requireSearchCorpus(req, res);
+  if (!scope) return;
+  const limit = Math.min(Number(req.query.limit) || 5, 20);
+  res.json(homeFeed({ corpusId: scope.corpusId, limit, includeDocuments: scope.includeDocuments }));
+});
 
 // Library: corpus-level recordings browser (nav spec §11) — CURRENT versions
 // with entry text, speaker, and origin-campaign provenance.

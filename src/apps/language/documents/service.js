@@ -80,7 +80,7 @@ export async function createDocument({ tmpPath, originalName, corpusId, originPr
   return { document };
 }
 
-const TYPE_LABEL = { '.pdf': 'PDF', '.docx': 'Word', '.xlsx': 'Excel', '.csv': 'CSV', '.txt': 'Text' };
+export const TYPE_LABEL = { '.pdf': 'PDF', '.docx': 'Word', '.xlsx': 'Excel', '.csv': 'CSV', '.txt': 'Text' };
 
 export function listDocuments({ corpusId, q, status, type, limit = 50, offset = 0 }) {
   const where = ['d.corpus_id = ?'];

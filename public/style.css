@@ -152,6 +152,37 @@ main {
 }
 .seg-tabs button.active { background: var(--accent); color: #fff; }
 /* Home stat tiles */
+/* ---- Master search + Home sections (master-search spec) ---- */
+.master-search { display: flex; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
+.master-search input[type="search"] {
+  flex: 1;
+  width: auto;
+  font-size: 1.05rem;
+  padding: 0.7rem 0.9rem;
+}
+.home-section { margin: 1.4rem 0; }
+.home-section-title { margin: 1rem 0 0; }
+.home-section-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  border-bottom: 1px solid var(--line); padding-bottom: 0.3rem; margin-bottom: 0.4rem;
+}
+.home-section-head h2 { margin: 0; font-size: 1.05rem; }
+.home-row {
+  display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; align-items: baseline;
+  padding: 0.5rem 0.2rem; border-bottom: 1px solid var(--line);
+  text-decoration: none; color: inherit;
+}
+a.home-row:hover { background: var(--panel); }
+.home-row > span:first-child, .home-row > a:first-of-type { min-width: 10rem; }
+.home-row-meta { color: var(--muted); font-size: 0.85rem; margin-left: auto; text-align: right; }
+.home-snippet { flex-basis: 100%; color: var(--muted); font-size: 0.9rem; }
+.home-snippet mark { background: #f3e3c2; color: inherit; padding: 0 2px; border-radius: 3px; }
+.home-row-recording { align-items: center; }
+.home-row-recording audio { max-width: 220px; height: 34px; }
+.home-empty { color: var(--muted); padding: 0.4rem 0.2rem; }
+.home-more { color: var(--muted); font-size: 0.85rem; margin: 0.4rem 0 0; }
+.muted { color: var(--muted); }
+
 .stat-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.8rem; margin: 1rem 0; }
 .stat-tiles a { text-decoration: none; color: inherit; }
 .stat-tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.9rem 1rem; }

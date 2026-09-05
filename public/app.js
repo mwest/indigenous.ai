@@ -2259,9 +2259,14 @@ function setupTranslateCard(entry) {
 
 const TARGET_HOURS = 10; // hours of transcribed audio per dialect
 
-// Home (nav spec §9): a collection-oriented overview — counts, recent
-// activity, quick actions. Campaign cards live on the Projects page.
-async function renderHome() {
+// Home (master-search spec): the primary discovery surface for the active
+// Collection. One search bar over Entries, Documents, and Recordings; with no
+// query, the latest activity in each. The query lives in the URL
+// (#/home?q=...) so refresh/back/copy all work; switching Collection reruns
+// the same query against the new one — never stale cross-corpus results.
+let homeSeq = 0; // discards fetches that land after a corpus/query change
+
+async function renderHome(searchQ = '') {
   const corpus = activeCorpus();
   if (!corpus) {
     view.innerHTML = `<div class="empty">
@@ -2271,7 +2276,9 @@ async function renderHome() {
     </div>`;
     return;
   }
+  const seq = ++homeSeq;
   await refreshCorpora();
+  if (seq !== homeSeq) return;
   const c = activeCorpus() ?? corpus;
   view.innerHTML = `
     <div class="page-head">
@@ -2281,6 +2288,13 @@ async function renderHome() {
         <a class="btn small" href="#/record">⏺ Start recording</a>
       </div>
     </div>
+    <form id="master-search" class="master-search" role="search">
+      <input type="search" name="q" value="${esc(searchQ)}" autocomplete="off"
+        placeholder="Search entries, documents, and recordings…" aria-label="Search this collection">
+      <button type="submit" id="ms-submit">Search</button>
+      ${searchQ ? '<button type="button" class="ghost" id="ms-clear">Clear</button>' : ''}
+    </form>
+    ${searchQ ? '' : `
     <div class="stat-tiles">
       <a href="#/entries"><div class="stat-tile"><div class="num">${c.entry_count}</div><div class="lbl">Entries</div></div></a>
       <a href="#/recordings"><div class="stat-tile"><div class="num">${c.recording_count}</div><div class="lbl">Recordings</div></div></a>
@@ -2290,23 +2304,100 @@ async function renderHome() {
     </div>
     ${isActiveOrgAdmin() ? `
       <p style="color:var(--muted)">${c.active_project_count} active project${c.active_project_count === 1 ? '' : 's'}
-        · <a href="#/projects">manage projects</a></p>` : ''}
-    <div class="card" id="home-recent"><h2 style="margin-top:0">Recent activity</h2>
-      <div class="empty">Loading…</div></div>`;
+        · <a href="#/projects">manage projects</a></p>` : ''}`}
+    <div id="home-content"><div class="empty">${searchQ ? 'Searching…' : 'Loading…'}</div></div>`;
 
-  // Recent entries via any campaign on the corpus (stats are corpus-scoped).
-  const anyCampaign = corpusProjects()[0];
-  if (!anyCampaign) { $('#home-recent .empty').textContent = 'No activity yet.'; return; }
-  try {
-    const stats = await api(`/projects/${anyCampaign.id}/stats`);
-    $('#home-recent .empty').outerHTML = stats.recent.length
-      ? `<table style="width:100%"><tbody>${stats.recent.map((r) => `
-          <tr><td><a href="#/entries/${r.id}" class="dene" lang="den">${esc(r.dene_text || '—')}</a></td>
-              <td>${esc(r.english_text || '')}</td>
-              <td style="color:var(--muted);white-space:nowrap">${esc(r.updated_by_name)} · ${fmtDate(r.updated_at)}</td></tr>`).join('')}
-        </tbody></table>`
-      : '<p class="empty">No activity yet.</p>';
-  } catch { $('#home-recent .empty').textContent = 'No activity yet.'; }
+  $('#master-search').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = e.target.q.value.trim();
+    const next = q ? `#/home?q=${encodeURIComponent(q)}` : '#/home';
+    if (location.hash === next) renderHome(q); // resubmitting the same query
+    else location.hash = next;                 // hashchange routes
+  });
+  $('#ms-clear')?.addEventListener('click', () => { location.hash = '#/home'; });
+
+  if (searchQ) {
+    $('#ms-submit').disabled = true; // no duplicate submissions mid-flight
+    try {
+      const data = await api(`/search?corpus_id=${c.id}&q=${encodeURIComponent(searchQ)}&limit=5`);
+      if (seq !== homeSeq) return;
+      $('#home-content').innerHTML = `
+        <h2 class="home-section-title">Search results for “${esc(searchQ)}”</h2>
+        ${homeSection('Entries', null, entryRowsHtml(data.entries.results, 'No matching entries.'), data.entries.has_more)}
+        ${data.documents ? homeSection('Documents', null, documentRowsHtml(data.documents.results, 'No matching documents.'), data.documents.has_more) : ''}
+        ${homeSection('Recordings', null, recordingRowsHtml(data.recordings.results, 'No matching recordings.'), data.recordings.has_more)}
+        ${!data.entries.results.length && !(data.documents?.results.length) && !data.recordings.results.length
+          ? `<p class="empty">No results for “${esc(searchQ)}”.<br>Try another word or phrase.</p>` : ''}`;
+    } catch (err) {
+      if (seq === homeSeq) $('#home-content').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    } finally {
+      if (seq === homeSeq) $('#ms-submit').disabled = false;
+    }
+  } else {
+    try {
+      const data = await api(`/home?corpus_id=${c.id}&limit=5`);
+      if (seq !== homeSeq) return;
+      $('#home-content').innerHTML = `
+        ${homeSection('Latest Entries', '#/entries', entryRowsHtml(data.entries, 'No entries yet.'))}
+        ${data.documents ? homeSection('Latest Documents', '#/documents', documentRowsHtml(data.documents, 'No documents yet.')) : ''}
+        ${homeSection('Latest Recordings', '#/recordings', recordingRowsHtml(data.recordings, 'No recordings yet.'))}`;
+    } catch (err) {
+      if (seq === homeSeq) $('#home-content').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    }
+  }
+}
+
+function homeSection(title, viewAllHref, bodyHtml, hasMore = false) {
+  return `<section class="home-section">
+    <div class="home-section-head">
+      <h2>${title}</h2>
+      ${viewAllHref ? `<a href="${viewAllHref}">View all</a>` : ''}
+    </div>
+    ${bodyHtml}
+    ${hasMore ? '<p class="home-more">More matches exist — try a more specific search.</p>' : ''}
+  </section>`;
+}
+
+function entryRowsHtml(list, emptyMsg) {
+  if (!list.length) return `<p class="home-empty">${emptyMsg}</p>`;
+  return list.map((e) => `
+    <a class="home-row" href="#/entries/${e.id}">
+      <span class="dene" lang="den">${esc(e.dene_text) || '<i class="muted">— needs translation —</i>'}</span>
+      <span>${esc(e.english_text) || '<i class="muted">— needs translation —</i>'}</span>
+      <span class="home-row-meta">
+        <span class="badge">${e.kind === 'phrase' ? 'Phrase' : 'Word'}</span>
+        ${e.category ? esc(e.category) + ' · ' : ''}${e.recording_count ? `${e.recording_count} 🔊` : ''}
+      </span>
+    </a>`).join('');
+}
+
+function documentRowsHtml(list, emptyMsg) {
+  if (!list.length) return `<p class="home-empty">${emptyMsg}</p>`;
+  return list.map((d) => {
+    const where = d.page_number ? `Page ${d.page_number}`
+      : d.sheet_name ? `${d.sheet_name}${d.row_number ? `, row ${d.row_number}` : ''}`
+      : d.row_number ? `Row ${d.row_number}` : '';
+    return `
+    <a class="home-row" href="#/documents/${d.document_id}">
+      <span><b>${esc(d.title)}</b></span>
+      <span class="home-row-meta">${esc(d.type_label)}${where ? ` · ${esc(where)}` : ''}
+        ${d.status && d.status !== 'ready' ? ` · ${esc(d.status)}` : ''}</span>
+      ${d.snippet ? `<span class="home-snippet">${esc(d.snippet).replace(/\[([^\]]{1,80}?)\]/g, '<mark>$1</mark>')}</span>` : ''}
+    </a>`;
+  }).join('');
+}
+
+function recordingRowsHtml(list, emptyMsg) {
+  if (!list.length) return `<p class="home-empty">${emptyMsg}</p>`;
+  return list.map((r) => `
+    <div class="home-row home-row-recording">
+      <audio controls preload="none" src="${esc(r.stream_url)}"></audio>
+      <a href="#/entries/${r.entry_id}" class="dene" lang="den">${esc(r.dene_text || r.english_text || `Entry #${r.entry_id}`)}</a>
+      <span class="home-row-meta">
+        ${r.speaker_name ? esc(r.speaker_name) + ' · ' : ''}${r.language === 'english' ? 'English' : 'Dene'}
+        · ${fmtDuration(r.duration_seconds)} · ${fmtDate(r.created_at)}
+      </span>
+    </div>`).join('');
 }
 
 // Library: corpus-level recordings browser (nav spec §11).
@@ -3529,6 +3620,11 @@ function route() {
   if (hash === '#/phrases') { listState.kind = 'phrase'; location.hash = '#/entries'; return; }
   if (hash === '#/phrases/new') { location.hash = '#/entries/new?kind=phrase'; return; }
 
+  // Home carries the master-search query in the URL: #/home?q=…
+  const homeMatch = hash.match(/^#\/home(?:\?(.*))?$/);
+  const homeQ = homeMatch ? (new URLSearchParams(homeMatch[1] ?? '').get('q') ?? '').trim() : '';
+  if (homeMatch) hash = '#/home';
+
   setActiveNav(hash);
   if (isTranslator()) {
     // Translators keep the focused experience: work sessions, entries
@@ -3542,7 +3638,7 @@ function route() {
     else location.hash = '#/home';
     return;
   }
-  if (hash === '#/home') renderHome();
+  if (hash === '#/home') renderHome(homeQ);
   else if (hash === '#/entries') renderEntries(listState.kind ?? '');
   else if ((m = hash.match(/^#\/entries\/new(\?kind=(word|phrase))?$/))) renderNewEntry(m[2] || 'word');
   else if ((m = hash.match(/^#\/entries\/(\d+)$/))) renderEntryDetail(m[1]);
