@@ -157,10 +157,10 @@ function searchRecordings({ corpusId, q, qvec, limit }) {
 
 function searchDocuments({ corpusId, q, qvec, limit }) {
   // Keyword candidates (spec §19): FTS over extracted blocks, plus
-  // title/filename matches. One result per document (spec §20) keeping its
-  // best passage. Semantic chunks arrive in the next phase — the fusion
-  // shape is already in place. qvec is accepted for that future use.
-  void qvec;
+  // title/filename matches. Semantic candidates: current-version
+  // document_search_chunks, brute-force cosine. Both fuse at chunk/document
+  // level and dedupe to one result per document with its best passage
+  // (spec §20).
   const bestBlock = new Map();
   const keyword = [];
   for (const b of searchBlocks({ q, corpusId, limit: POOL })) {
@@ -183,26 +183,65 @@ function searchDocuments({ corpusId, q, qvec, limit }) {
     else { const k = { id: d.id, boost }; byId.set(d.id, k); keyword.push(k); }
   }
 
-  const ids = rrfFuse(keyword, []);
+  // Semantic candidates: best chunk per document, current versions of
+  // non-archived documents, current model only (spec §19).
+  const semantic = [];
+  const bestChunk = new Map();
+  let chunkCount = 0;
+  if (qvec) {
+    const rows = db.prepare(
+      `SELECT c.embedding, c.text, c.page_number, c.sheet_name, c.row_number,
+              v.document_id
+       FROM document_search_chunks c
+       JOIN document_versions v ON v.id = c.document_version_id
+       JOIN documents d ON d.id = v.document_id
+       WHERE d.corpus_id = ? AND d.status <> 'archived'
+         AND c.embedding IS NOT NULL AND c.embedding_model = ?
+         AND v.version_number = (SELECT MAX(v2.version_number) FROM document_versions v2
+                                 WHERE v2.document_id = v.document_id)`
+    ).all(corpusId, MODEL);
+    chunkCount = rows.length;
+    rows.forEach((r) => { r.score = cosine(qvec, fromBlob(r.embedding)); });
+    rows.sort((a, b) => b.score - a.score);
+    for (const r of rows.slice(0, POOL)) {
+      if (bestChunk.has(r.document_id)) continue;
+      bestChunk.set(r.document_id, r);
+      semantic.push({ id: r.document_id, score: r.score });
+    }
+  }
+
+  const ids = rrfFuse(keyword, semantic);
   return {
+    chunkCount,
     results: inOrder(ids.slice(0, limit),
       `SELECT d.id, d.title, d.extension, d.status, d.created_at FROM documents d WHERE d.id IN`)
       .map((d) => {
+        // Prefer the FTS passage (real keyword highlighting); a semantic-only
+        // hit shows its best chunk as plain text — no fabricated highlights.
         const hit = bestBlock.get(d.id);
+        const chunk = bestChunk.get(d.id);
         return {
           document_id: d.id,
           title: d.title,
           type_label: TYPE_LABEL[d.extension] ?? d.extension,
           status: d.status,
           created_at: d.created_at,
-          snippet: hit?.snippet ?? null,
-          page_number: hit?.page_number ?? null,
-          sheet_name: hit?.sheet_name ?? null,
-          row_number: hit?.row_number ?? null,
+          snippet: hit?.snippet ?? (chunk ? excerpt(chunk.text) : null),
+          page_number: hit?.page_number ?? chunk?.page_number ?? null,
+          sheet_name: hit?.sheet_name ?? chunk?.sheet_name ?? null,
+          row_number: hit?.row_number ?? chunk?.row_number ?? null,
         };
       }),
     has_more: ids.length > limit,
   };
+}
+
+/** Plain-text excerpt for semantic-only passages (~160 chars on a word edge). */
+function excerpt(text, max = 160) {
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  return `${cut.slice(0, cut.lastIndexOf(' ') > 60 ? cut.lastIndexOf(' ') : max)} …`;
 }
 
 /** One request, one query embedding, three grouped sections (spec §5/§6).
@@ -227,9 +266,13 @@ export async function masterSearch({ corpusId, q, limit = 5, includeDocuments = 
     ? timed(() => searchDocuments({ corpusId, q, qvec, limit }))
     : [null, 0];
   const [recordings, recordingsMs] = timed(() => searchRecordings({ corpusId, q, qvec, limit }));
-  // Timing only — never the query text (spec §35).
+  const chunkCount = documents?.chunkCount ?? 0;
+  if (documents) delete documents.chunkCount; // instrumentation, not payload
+  // Timing only — never the query text (spec §35). document_chunks tracks
+  // when brute-force cosine needs replacing (spec §36).
   console.log(`[search] corpus=${corpusId} q_len=${q.length} embed_ms=${embedMs} ` +
-    `entries_ms=${entriesMs} documents_ms=${documentsMs} recordings_ms=${recordingsMs} total_ms=${Date.now() - t0}`);
+    `entries_ms=${entriesMs} documents_ms=${documentsMs} recordings_ms=${recordingsMs} ` +
+    `total_ms=${Date.now() - t0} document_chunks=${chunkCount}`);
   return {
     query: q,
     corpus_id: corpusId,

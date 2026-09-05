@@ -2150,6 +2150,143 @@ if (BASE.includes('localhost')) {
   check('msearch: cleanup complete', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- document semantic search (master-search spec phase B, §40) ---
+{
+  const { default: db } = await import('../src/db.js');
+  const { MODEL } = await import('../src/embed.js');
+  const { execSync } = await import('node:child_process');
+  const ts = Date.now();
+  const projName = `DocSem ${ts}`;
+  r = await sa.req('POST', '/api/projects', { name: projName, dialect: 'Dëne Sųłıné' });
+  const proj = r.data;
+  const corpusId = proj.corpus_id;
+
+  const upload = async (name, buf) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([buf]), name);
+    fd.append('corpus_id', String(corpusId));
+    return sa.req('POST', '/api/documents', fd, true);
+  };
+  const waitReady = async (id) => {
+    for (let i = 0; i < 80; i++) {
+      const d = (await sa.req('GET', `/api/documents/${id}`)).data;
+      if (['ready', 'failed'].includes(d.status)) return d;
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return (await sa.req('GET', `/api/documents/${id}`)).data;
+  };
+  const currentVersionRow = (docId) => db.prepare(
+    `SELECT * FROM document_versions WHERE document_id = ? ORDER BY version_number DESC LIMIT 1`).get(docId);
+  const waitSemantic = async (docId) => {
+    for (let i = 0; i < 120; i++) {
+      const v = currentVersionRow(docId);
+      if (['ready', 'failed'].includes(v?.semantic_status)) return v;
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return currentVersionRow(docId);
+  };
+  const chunksOf = (docId) => db.prepare(
+    `SELECT c.* FROM document_search_chunks c WHERE c.document_version_id = ? ORDER BY c.ordinal`
+  ).all(currentVersionRow(docId).id);
+
+  // TXT fixture (spec §40) — the semantic query shares no keywords with it.
+  r = await upload('winter-preservation.txt', Buffer.from(
+    'Whitefish were dried and stored for use during the winter.\n\nFamilies gathered berries in late summer.\n'));
+  const semDocId = r.data.id;
+  await waitReady(semDocId);
+  let v = await waitSemantic(semDocId);
+  check('docsem: semantic indexing reaches ready after document ready',
+    v.semantic_status === 'ready' && v.semantic_model === MODEL && !!v.semantic_indexed_at,
+    JSON.stringify({ s: v.semantic_status, e: v.semantic_error }));
+  let chunks = chunksOf(semDocId);
+  check('docsem: chunks built and embedded with the current model',
+    chunks.length >= 1 && chunks.every((c) => c.embedding && c.embedding_model === MODEL && c.content_hash),
+    chunks.length);
+
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusId}&q=${encodeURIComponent('traditional fish preservation')}`);
+  check('docsem: document found semantically (no keyword overlap)',
+    r.data.documents.results.some((d) => d.document_id === semDocId),
+    JSON.stringify(r.data.documents?.results));
+  const semHit = r.data.documents.results.find((d) => d.document_id === semDocId);
+  check('docsem: semantic-only passage is plain text — no fabricated highlights',
+    !!semHit?.snippet && !semHit.snippet.includes('['), JSON.stringify(semHit?.snippet));
+
+  // XLSX chunks carry sheet/row provenance and column context.
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Words');
+  ws.addRow(['English', 'Dene', 'Category']);
+  ws.addRow(['fish', 'łue', 'animals']);
+  r = await upload('docsem-words.xlsx', Buffer.from(await wb.xlsx.writeBuffer()));
+  const xlsxDocId = r.data.id;
+  await waitReady(xlsxDocId);
+  v = await waitSemantic(xlsxDocId);
+  const xchunks = chunksOf(xlsxDocId);
+  check('docsem: spreadsheet chunks keep sheet/row and column context',
+    v.semantic_status === 'ready' && xchunks.length === 1 &&
+    xchunks[0].sheet_name === 'Words' && xchunks[0].row_number === 2 &&
+    xchunks[0].text.includes('English: fish') && xchunks[0].text.includes('Dene: łue'),
+    JSON.stringify(xchunks[0]));
+
+  // PDF chunks keep page provenance.
+  r = await upload('docsem-report.pdf', makePdfFixture('The elders remember long journeys across the frozen lake.'));
+  const pdfDocId = r.data.id;
+  await waitReady(pdfDocId);
+  v = await waitSemantic(pdfDocId);
+  const pchunks = chunksOf(pdfDocId);
+  check('docsem: PDF chunks keep page provenance',
+    v.semantic_status === 'ready' && pchunks.length >= 1 && pchunks[0].page_number === 1,
+    JSON.stringify(pchunks[0]?.page_number));
+
+  // Archived documents leave semantic search too.
+  await sa.req('POST', `/api/documents/${semDocId}/archive`);
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusId}&q=${encodeURIComponent('traditional fish preservation')}`);
+  check('docsem: archived documents never appear semantically',
+    !r.data.documents.results.some((d) => d.document_id === semDocId));
+  await sa.req('POST', `/api/documents/${semDocId}/restore`);
+
+  // Reprocess rebuilds chunks and embeddings (original untouched — phase B+C
+  // block covers the sha; here we check the derivatives regenerate).
+  const oldChunkIds = chunksOf(semDocId).map((c) => c.id);
+  await sa.req('POST', `/api/documents/${semDocId}/reprocess`);
+  await waitReady(semDocId);
+  v = await waitSemantic(semDocId);
+  chunks = chunksOf(semDocId);
+  check('docsem: reprocess rebuilds chunks and re-embeds',
+    v.semantic_status === 'ready' && chunks.length >= 1 &&
+    chunks.every((c) => c.embedding && c.embedding_model === MODEL) &&
+    !chunks.some((c) => oldChunkIds.includes(c.id)),
+    JSON.stringify({ s: v.semantic_status, n: chunks.length }));
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusId}&q=${encodeURIComponent('traditional fish preservation')}`);
+  check('docsem: semantic search works after reprocess',
+    r.data.documents.results.some((d) => d.document_id === semDocId));
+
+  // A stale model marks vectors ineligible, and the backfill regenerates them.
+  const semVersion = currentVersionRow(semDocId);
+  db.prepare(`UPDATE document_search_chunks SET embedding_model = 'stale-model' WHERE document_version_id = ?`)
+    .run(semVersion.id);
+  db.prepare(`UPDATE document_versions SET semantic_model = 'stale-model' WHERE id = ?`).run(semVersion.id);
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusId}&q=${encodeURIComponent('traditional fish preservation')}`);
+  check('docsem: stale-model vectors sit out semantic ranking',
+    !r.data.documents.results.some((d) => d.document_id === semDocId));
+  execSync(`node scripts/document-embed-backfill.js`, { cwd: process.cwd(), env: process.env, stdio: 'pipe' });
+  const refreshed = chunksOf(semDocId);
+  check('docsem: backfill regenerates stale-model embeddings',
+    refreshed.length >= 1 && refreshed.every((c) => c.embedding && c.embedding_model === MODEL) &&
+    currentVersionRow(semDocId).semantic_model === MODEL,
+    JSON.stringify(refreshed.map((c) => c.embedding_model)));
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusId}&q=${encodeURIComponent('traditional fish preservation')}`);
+  check('docsem: semantic search restored after backfill',
+    r.data.documents.results.some((d) => d.document_id === semDocId));
+
+  // cleanup
+  for (const [id, title] of [[semDocId, 'winter-preservation.txt'], [xlsxDocId, 'docsem-words.xlsx'], [pdfDocId, 'docsem-report.pdf']]) {
+    await sa.req('DELETE', `/api/documents/${id}`, { confirm_title: title });
+  }
+  r = await sa.req('DELETE', `/api/projects/${proj.id}`, { confirm_name: projName });
+  check('docsem: cleanup complete', r.status === 200, JSON.stringify(r.data));
+}
+
 // --- root sign-in page ---
 {
   const anon = client();

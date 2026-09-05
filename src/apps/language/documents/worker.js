@@ -6,6 +6,7 @@
 import db from '../../../db.js';
 import { uuidv7 } from '../../../platform/uid.js';
 import { extractDocument } from './extractors/index.js';
+import { semanticIndexVersion, markSemanticFailed } from './semantic.js';
 import { absolutePath, SUPPORTED } from './storage.js';
 
 const MAX_ATTEMPTS = Number(process.env.DOCUMENT_JOB_MAX_ATTEMPTS) || 3;
@@ -35,9 +36,13 @@ function recoverStaleJobs() {
     `UPDATE ingestion_jobs SET status = 'failed', completed_at = datetime('now'),
        error_message = COALESCE(error_message, 'abandoned after crash')
      WHERE status = 'running' AND attempts >= ? AND started_at < datetime('now', ?)
-     RETURNING document_version_id`
+     RETURNING document_version_id, job_type`
   ).all(MAX_ATTEMPTS, `-${STALE_MINUTES} minutes`);
   for (const j of dead) {
+    if (j.job_type === 'semantic_index') {
+      markSemanticFailed(j.document_version_id, 'Semantic indexing was interrupted too many times');
+      continue; // the document itself stays ready (spec §15)
+    }
     const v = db.prepare('SELECT document_id FROM document_versions WHERE id = ?').get(j.document_version_id);
     if (v) setDocStatus(v.document_id, 'failed', 'Processing was interrupted too many times');
   }
@@ -79,9 +84,17 @@ async function runJob(job) {
   } else if (job.job_type === 'index') {
     // FTS rows are kept in sync by triggers as blocks are written; this stage
     // merges the index so first searches are fast, then flips to ready.
+    // Semantic indexing runs AFTER ready and never gates it (spec §15/§16).
     db.exec(`INSERT INTO document_blocks_fts(document_blocks_fts) VALUES ('optimize')`);
-    setDocStatus(doc.id, 'ready');
+    db.transaction(() => {
+      setDocStatus(doc.id, 'ready');
+      db.prepare(`INSERT INTO ingestion_jobs (document_version_id, job_type) VALUES (?, 'semantic_index')`)
+        .run(version.id);
+    })();
     console.log(`[documents] indexed ${doc.uid} — ready`);
+  } else if (job.job_type === 'semantic_index') {
+    const { chunks, embedded, reused } = await semanticIndexVersion(version.id);
+    console.log(`[documents] semantic-indexed ${doc.uid}: ${chunks} chunks (${embedded} embedded, ${reused} reused)`);
   }
 }
 
@@ -99,8 +112,16 @@ async function tick() {
       db.prepare(
         `UPDATE ingestion_jobs SET status = ?, error_message = ?, completed_at = datetime('now') WHERE id = ?`
       ).run(retriable ? 'queued' : 'failed', String(err.message).slice(0, 500), job.id);
-      const v = db.prepare('SELECT document_id FROM document_versions WHERE id = ?').get(job.document_version_id);
-      if (v && !retriable) setDocStatus(v.document_id, 'failed', String(err.message).slice(0, 500));
+      if (!retriable) {
+        // Semantic failure marks only the VERSION's semantic state — the
+        // document itself stays ready/searchable by keyword (spec §15).
+        if (job.job_type === 'semantic_index') {
+          markSemanticFailed(job.document_version_id, err.message);
+        } else {
+          const v = db.prepare('SELECT document_id FROM document_versions WHERE id = ?').get(job.document_version_id);
+          if (v) setDocStatus(v.document_id, 'failed', String(err.message).slice(0, 500));
+        }
+      }
       console.error(`[documents] job ${job.id} (${job.job_type}) failed (attempt ${job.attempts}):`, err.message);
       if (retriable) return; // back off until the next tick
     }
