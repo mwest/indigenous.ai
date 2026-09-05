@@ -2070,6 +2070,20 @@ if (BASE.includes('localhost')) {
   check('msearch: entry without embedding found by keyword',
     r.data.entries.results.some((e) => e.id === noEmbedId));
 
+  // Entries-page smart search follows the same rules (spec §11): a
+  // stale-model vector ranks with the unembedded instead of winning on old
+  // similarity — "greeting" would otherwise put the stale entry first.
+  db.prepare(`UPDATE entries SET embedding_model = 'stale-model' WHERE id = ?`).run(greetId);
+  r = await sa.req('GET', `/api/entries?corpus_id=${corpusA}&q=greeting&semantic=1`);
+  check('msearch: entries smart search treats stale-model vectors as unembedded',
+    r.status === 200 && r.data.semantic === true && r.data.entries[0]?.id === fishId,
+    JSON.stringify(r.data.entries?.map((e) => e.id)));
+  db.prepare(`UPDATE entries SET embedding_model = (SELECT embedding_model FROM entries WHERE id = ?) WHERE id = ?`)
+    .run(fishId, greetId);
+  r = await sa.req('GET', `/api/entries?corpus_id=${corpusA}&q=greeting&semantic=1`);
+  check('msearch: restored model puts meaning back in charge',
+    r.data.entries[0]?.id === greetId, JSON.stringify(r.data.entries?.map((e) => e.id)));
+
   // Speaker keyword finds the recording; superseding hides the old version.
   r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=${encodeURIComponent('Jane Semantic')}`);
   check('msearch: speaker name finds the recording',

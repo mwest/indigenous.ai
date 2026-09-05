@@ -1222,13 +1222,18 @@ async function loadEntryList() {
   try { data = await api('/entries?' + params); }
   catch (err) { listEl.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
 
+  // Smart search asked for but unavailable: the server fell back to keyword
+  // matching rather than failing — say so instead of pretending.
+  const fallbackNote = listState.semantic && listState.q && data.semantic === false
+    ? '<p class="home-empty">Smart search is temporarily unavailable — showing keyword matches.</p>' : '';
+
   if (!data.entries.length) {
-    listEl.innerHTML = `<div class="empty">No ${listState.kind === 'phrase' ? 'phrases' : 'entries'} found.</div>`;
+    listEl.innerHTML = `${fallbackNote}<div class="empty">No ${listState.kind === 'phrase' ? 'phrases' : 'entries'} found.</div>`;
     $('#pager').innerHTML = '';
     return;
   }
 
-  listEl.innerHTML = data.entries.map((e) => {
+  listEl.innerHTML = fallbackNote + data.entries.map((e) => {
     const incomplete = !e.dene_text || !e.english_text;
     return `
     <a class="entry-row" href="#/entries/${e.id}">
