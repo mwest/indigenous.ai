@@ -2000,6 +2000,156 @@ if (BASE.includes('localhost')) {
   check('import: cleanup complete', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- master search + home feed (master-search spec §38–§42) ---
+{
+  const { default: db } = await import('../src/db.js');
+  const ts = Date.now();
+  const projAName = `SearchA ${ts}`;
+  const projBName = `SearchB ${ts}`;
+  r = await sa.req('POST', '/api/projects', { name: projAName, dialect: 'Dëne Sųłıné' });
+  const projA = r.data;
+  const corpusA = projA.corpus_id;
+  r = await sa.req('POST', '/api/projects', { name: projBName, dialect: 'Dëne Sųłıné' });
+  const projB = r.data;
+  const corpusB = projB.corpus_id;
+
+  // Entries: a semantic target, an exact-Dene word, a keyword-only entry with
+  // no embedding (blank English side), and the SAME word in corpus B.
+  r = await sa.req('POST', '/api/entries', { project_id: projA.id, kind: 'phrase', dene_text: 'dánet’é', english_text: 'how are you' });
+  const greetId = r.data.id;
+  r = await sa.req('POST', '/api/entries', { project_id: projA.id, kind: 'word', dene_text: 'łue', english_text: 'fish' });
+  const fishId = r.data.id;
+  r = await sa.req('POST', '/api/entries', { project_id: projA.id, kind: 'phrase', dene_text: 'sǫǫ̀mbaà', english_text: '' });
+  const noEmbedId = r.data.id;
+  r = await sa.req('POST', '/api/entries', { project_id: projB.id, kind: 'word', dene_text: 'łue', english_text: 'fish' });
+  const fishBId = r.data.id;
+
+  // Recording on the greeting entry, speaker Jane.
+  let sfd = new FormData();
+  sfd.append('file', new Blob([makeWav(2)], { type: 'audio/wav' }), 'greet.wav');
+  sfd.append('speaker', 'Jane Semantic');
+  sfd.append('language', 'dene');
+  r = await sa.req('POST', `/api/entries/${greetId}/audio`, sfd, true);
+  check('msearch: recording uploaded', r.status === 201, JSON.stringify(r.data));
+  const greetAudio1 = r.data.id;
+
+  // Background embeddings must land before semantic assertions.
+  const waitEmbed = async (ids) => {
+    for (let i = 0; i < 120; i++) {
+      const n = db.prepare(`SELECT COUNT(*) n FROM entries WHERE id IN (${ids.join(',')}) AND embedding IS NOT NULL`).get().n;
+      if (n === ids.length) return true;
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return false;
+  };
+  check('msearch: entry embeddings computed in the background', await waitEmbed([greetId, fishId, fishBId]));
+
+  // Semantic discovery: "greeting" -> "how are you", entry AND its recording.
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=greeting`);
+  check('msearch: semantic entry hit ("greeting" finds "how are you")',
+    r.status === 200 && r.data.entries.results.some((e) => e.id === greetId),
+    JSON.stringify(r.data.entries?.results?.map((e) => e.english_text)));
+  check('msearch: semantic reported available with model',
+    r.data.semantic?.available === true && !!r.data.semantic.model);
+  check('msearch: recording inherits parent-entry semantics',
+    r.data.recordings.results.some((x) => x.id === greetAudio1),
+    JSON.stringify(r.data.recordings?.results?.map((x) => x.id)));
+
+  // Exact Dene orthography ranks first and never crosses corpora.
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=${encodeURIComponent('łue')}`);
+  check('msearch: exact Dene match ranks first', r.data.entries.results[0]?.id === fishId,
+    JSON.stringify(r.data.entries.results?.[0]));
+  check('msearch: corpus isolation — no corpus-B entries', !r.data.entries.results.some((e) => e.id === fishBId));
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusB}&q=${encodeURIComponent('łue')}`);
+  check('msearch: corpus B sees only its own copy',
+    r.data.entries.results.length === 1 && r.data.entries.results[0].id === fishBId,
+    JSON.stringify(r.data.entries.results?.map((e) => e.id)));
+
+  // No embedding -> still keyword-discoverable (diacritics exact).
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=${encodeURIComponent('sǫǫ̀mbaà')}`);
+  check('msearch: entry without embedding found by keyword',
+    r.data.entries.results.some((e) => e.id === noEmbedId));
+
+  // Speaker keyword finds the recording; superseding hides the old version.
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=${encodeURIComponent('Jane Semantic')}`);
+  check('msearch: speaker name finds the recording',
+    r.data.recordings.results.some((x) => x.id === greetAudio1),
+    JSON.stringify(r.data.recordings?.results));
+  sfd = new FormData();
+  sfd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'greet-v2.wav');
+  sfd.append('speaker', 'Jane Semantic');
+  sfd.append('language', 'dene');
+  r = await sa.req('POST', `/api/entries/${greetId}/audio`, sfd, true);
+  const greetAudio2 = r.data.id;
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=${encodeURIComponent('Jane Semantic')}`);
+  check('msearch: superseded recordings never returned',
+    r.data.recordings.results.some((x) => x.id === greetAudio2) &&
+    !r.data.recordings.results.some((x) => x.id === greetAudio1),
+    JSON.stringify(r.data.recordings.results?.map((x) => x.id)));
+
+  // Documents inside master search (keyword/FTS path).
+  const dfd = new FormData();
+  dfd.append('file', new Blob([Buffer.from('Whitefish were dried and stored for use during the winter.\n')]), 'winter-fish-notes.txt');
+  dfd.append('corpus_id', String(corpusA));
+  r = await sa.req('POST', '/api/documents', dfd, true);
+  const searchDocId = r.data.id;
+  for (let i = 0; i < 80; i++) {
+    const d = (await sa.req('GET', `/api/documents/${searchDocId}`)).data;
+    if (['ready', 'failed'].includes(d.status)) break;
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=whitefish`);
+  check('msearch: document found through FTS with snippet',
+    r.data.documents.results[0]?.document_id === searchDocId && /hitefish/.test(r.data.documents.results[0]?.snippet ?? ''),
+    JSON.stringify(r.data.documents?.results?.[0]));
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=winter-fish-notes`);
+  check('msearch: document found by title/filename', r.data.documents.results.some((d) => d.document_id === searchDocId));
+
+  // Home latest feed (spec §24/§25).
+  r = await sa.req('GET', `/api/home?corpus_id=${corpusA}`);
+  check('msearch: home feed lists latest entries/documents/recordings',
+    r.status === 200 && r.data.entries.length === 3 &&
+    r.data.documents.some((d) => d.document_id === searchDocId) &&
+    r.data.recordings.length === 1 && r.data.recordings[0].id === greetAudio2,
+    JSON.stringify({ e: r.data.entries?.length, d: r.data.documents?.length, r: r.data.recordings?.length }));
+  await sa.req('POST', `/api/documents/${searchDocId}/archive`);
+  r = await sa.req('GET', `/api/home?corpus_id=${corpusA}`);
+  check('msearch: archived documents leave the home feed', !r.data.documents.some((d) => d.document_id === searchDocId));
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=whitefish`);
+  check('msearch: archived documents leave master search', !r.data.documents.results.some((d) => d.document_id === searchDocId));
+  await sa.req('POST', `/api/documents/${searchDocId}/restore`);
+
+  // Translator privacy (spec §33): no documents key — not even a count.
+  const strEmail = `searchtr-${ts}@test.ca`;
+  await sa.req('POST', `/api/projects/${projA.id}/members`, { email: strEmail, name: 'Search Translator', password: 'searchtr-pass-1', role: 'translator' });
+  const str = client();
+  await str.req('POST', '/api/login', { email: strEmail, password: 'searchtr-pass-1' });
+  r = await str.req('GET', `/api/search?corpus_id=${corpusA}&q=whitefish`);
+  check('msearch: translators get no documents section at all',
+    r.status === 200 && !('documents' in r.data) && Array.isArray(r.data.entries.results), JSON.stringify(Object.keys(r.data ?? {})));
+  r = await str.req('GET', `/api/home?corpus_id=${corpusA}`);
+  check('msearch: translator home feed has no documents key', r.status === 200 && !('documents' in r.data));
+
+  // Entitlement isolation (spec §38): disabling Language forbids search.
+  const orgId = db.prepare('SELECT organization_id FROM corpora WHERE id = ?').get(corpusA).organization_id;
+  await sa.req('PUT', `/api/orgs/${orgId}/apps/language`, { status: 'disabled' });
+  const forbidden = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=fish`);
+  const forbiddenHome = await sa.req('GET', `/api/home?corpus_id=${corpusA}`);
+  await sa.req('PUT', `/api/orgs/${orgId}/apps/language`, { status: 'enabled' });
+  check('msearch: disabled entitlement forbids search and home', forbidden.status === 403 && forbiddenHome.status === 403,
+    `${forbidden.status}/${forbiddenHome.status}`);
+  r = await sa.req('GET', `/api/search?corpus_id=${corpusA}&q=fish`);
+  check('msearch: re-enabled entitlement restores search', r.status === 200, r.status);
+
+  // cleanup: document, translator, then projects (sole campaigns sweep corpora).
+  await sa.req('DELETE', `/api/documents/${searchDocId}`, { confirm_title: 'winter-fish-notes.txt' });
+  await sa.req('DELETE', `/api/projects/${projA.id}`, { confirm_name: projAName });
+  await sa.req('DELETE', `/api/projects/${projB.id}`, { confirm_name: projBName });
+  const strUser = db.prepare('SELECT id FROM users WHERE email = ?').get(strEmail);
+  r = await sa.req('DELETE', `/api/users/${strUser.id}`);
+  check('msearch: cleanup complete', r.status === 200, JSON.stringify(r.data));
+}
+
 // --- root sign-in page ---
 {
   const anon = client();
