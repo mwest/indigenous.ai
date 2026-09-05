@@ -165,6 +165,11 @@ export function reprocessDocument(documentId) {
   if (!version) return false;
   db.transaction(() => {
     db.prepare('DELETE FROM document_blocks WHERE document_version_id = ?').run(version.id);
+    // Semantic derivatives rebuild with the rest — stale chunks must not keep
+    // serving results for content that is being re-extracted.
+    db.prepare('DELETE FROM document_search_chunks WHERE document_version_id = ?').run(version.id);
+    db.prepare(`UPDATE document_versions SET semantic_status = 'pending', semantic_error = NULL WHERE id = ?`)
+      .run(version.id);
     db.prepare(`DELETE FROM ingestion_jobs WHERE document_version_id = ? AND status IN ('queued', 'running')`).run(version.id);
     db.prepare(`INSERT INTO ingestion_jobs (document_version_id, job_type) VALUES (?, 'extract')`).run(version.id);
     db.prepare(`UPDATE documents SET status = 'uploaded', error_message = NULL, updated_at = datetime('now') WHERE id = ?`)
