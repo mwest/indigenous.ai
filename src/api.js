@@ -1654,7 +1654,16 @@ language.get('/entries', async (req, res) => {
   const visibleCorpora = [...new Set(visibleProjects.map((p) => p.corpus_id).filter(Boolean))];
 
   const q = String(req.query.q ?? '').trim();
-  const semantic = !!q && (req.query.semantic === '1' || req.query.semantic === 'yes');
+  // Smart search: embed up front so an embedding failure degrades to keyword
+  // filtering instead of failing the request (master-search spec §7 principle;
+  // this used to 503). qvec === null below means "keyword mode".
+  let qvec = null;
+  if (q && (req.query.semantic === '1' || req.query.semantic === 'yes')
+      && process.env.SEMANTIC_SEARCH_DISABLED !== '1') {
+    try { qvec = await embed(q); }
+    catch (e) { console.error('[entries] embed failed — keyword fallback:', e.message); }
+  }
+  const semantic = !!qvec;
   const where = [];
   const params = [];
 
@@ -1747,19 +1756,17 @@ language.get('/entries', async (req, res) => {
 
   if (semantic) {
     // Rank the in-scope entries by cosine similarity of their English embedding
-    // to the query, with substring matches boosted above pure meaning matches.
+    // to the query (embedded once above). Rank purely by semantic similarity —
+    // exact substring matches are not boosted, so a closer-in-meaning result
+    // can outrank a literal one. A vector from an older model is stale and
+    // ranks with the unembedded (master-search spec §11).
     const cands = db
-      .prepare(`SELECT e.id, e.dene_text, e.english_text, e.embedding FROM entries e ${whereSql}`)
+      .prepare(`SELECT e.id, e.embedding, e.embedding_model FROM entries e ${whereSql}`)
       .all(...params);
-    let qvec;
-    try { qvec = await embed(q); }
-    catch { return bad(res, 'Semantic search is temporarily unavailable', 503); }
-    // Rank purely by semantic similarity — exact substring matches are not
-    // boosted, so a closer-in-meaning result can outrank a literal one.
     const ranked = cands
       .map((c) => ({
         id: c.id,
-        score: c.embedding ? cosine(qvec, fromBlob(c.embedding)) : -1,
+        score: c.embedding && c.embedding_model === MODEL ? cosine(qvec, fromBlob(c.embedding)) : -1,
       }))
       .sort((a, b) => b.score - a.score);
 
@@ -1783,7 +1790,10 @@ language.get('/entries', async (req, res) => {
     .prepare(`${entrySelect} ${whereSql} ORDER BY e.updated_at DESC, e.id DESC LIMIT ? OFFSET ?`)
     .all(...entryParams(req.user), ...params, limit, offset);
 
-  res.json({ entries, total, limit, offset });
+  // semantic:false only when smart search was asked for but unavailable —
+  // the client shows a keyword-fallback hint.
+  const wanted = !!q && (req.query.semantic === '1' || req.query.semantic === 'yes');
+  res.json({ entries, total, limit, offset, ...(wanted ? { semantic: false } : {}) });
 });
 
 function loadEntry(req, res, next) {
