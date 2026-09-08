@@ -2435,6 +2435,75 @@ if (BASE.includes('localhost')) {
   check('flat: cleanup complete', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- zero-campaign browsing (flat-collection §17 regression) ---
+// The reported bug: an org with NO campaigns imported a spreadsheet
+// ("imported 2083 records") but the Entries page showed nothing — list
+// visibility and entry roles were still campaign-derived instead of
+// org-derived.
+{
+  const { default: db } = await import('../src/db.js');
+  const ts = Date.now();
+  const zEmail = `zc-${ts}@test.ca`;
+  r = await sa.req('POST', '/api/users', { email: zEmail, name: 'Zero Campaign', password: 'zc-pass-1' });
+  const zUserId = r.data.user_id ?? r.data.id;
+  r = await sa.req('POST', '/api/orgs', { name: `ZeroCamp ${ts}`, owner_email: zEmail });
+  const zOrg = r.data.id;
+  const zc = client();
+  await zc.req('POST', '/api/login', { email: zEmail, password: 'zc-pass-1' });
+  const zCorpus = db.prepare('SELECT id FROM corpora WHERE organization_id = ? AND is_default = 1').get(zOrg).id;
+
+  const fd0 = new FormData();
+  fd0.append('file', new Blob([Buffer.from('English,Dene\nplate,tth’ay\nknife,bes\n')]), 'zc-words.csv');
+  fd0.append('corpus_id', String(zCorpus));
+  r = await zc.req('POST', '/api/documents', fd0, true);
+  const zDoc = r.data.id;
+  for (let i = 0; i < 80; i++) {
+    const d = (await zc.req('GET', `/api/documents/${zDoc}`)).data;
+    if (['ready', 'failed'].includes(d.status)) break;
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  r = await zc.req('POST', `/api/documents/${zDoc}/create-entries`, {
+    kind: 'word', mapping: { English: 'english', Dene: 'dene' },
+  });
+  check('zc: spreadsheet import works with zero campaigns',
+    r.status === 200 && r.data.created === 2 && r.data.project_id === null, JSON.stringify(r.data));
+
+  r = await zc.req('GET', `/api/entries?corpus_id=${zCorpus}`);
+  check('zc: Entries page lists the imported entries (the reported bug)',
+    r.status === 200 && r.data.total === 2, JSON.stringify({ s: r.status, t: r.data.total ?? r.data }));
+  r = await zc.req('GET', '/api/entries');
+  check('zc: unscoped entries list sees the collection too', r.status === 200 && r.data.total === 2,
+    JSON.stringify({ s: r.status, t: r.data.total }));
+  const zEntry = r.data.entries[0].id;
+  r = await zc.req('GET', `/api/entries/${zEntry}`);
+  check('zc: entry detail readable and editable with zero campaigns',
+    r.status === 200 && r.data.can_edit === true, JSON.stringify({ s: r.status, e: r.data.can_edit }));
+  r = await zc.req('PATCH', `/api/entries/${zEntry}`, { category: 'household' });
+  check('zc: entry edit works', r.status === 200, r.status);
+
+  const fdA = new FormData();
+  fdA.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'zc.wav');
+  fdA.append('language', 'dene');
+  r = await zc.req('POST', `/api/entries/${zEntry}/audio`, fdA, true);
+  check('zc: recording works with zero campaigns', r.status === 201, JSON.stringify(r.data));
+  const zAudio = r.data.id;
+  r = await zc.raw('GET', `/api/audio/${zAudio}/stream`);
+  check('zc: recording streams (loadAudio role via org)', r.status === 200, r.status);
+  r = await zc.req('GET', `/api/search?corpus_id=${zCorpus}&q=knife`);
+  check('zc: master search agrees with the entries page',
+    r.data.entries.results[0]?.english_text === 'knife', // 'plate' may follow semantically
+    JSON.stringify(r.data.entries?.results?.map((e) => e.english_text)));
+
+  // cleanup: entries first (they cite the document), then document, org, user.
+  const zAll = db.prepare('SELECT id FROM entries WHERE corpus_id = ?').all(zCorpus);
+  for (const e of zAll) await zc.req('DELETE', `/api/entries/${e.id}`);
+  await zc.req('DELETE', `/api/documents/${zDoc}`, { confirm_title: 'zc-words.csv' });
+  r = await zc.req('DELETE', `/api/orgs/${zOrg}`);
+  check('zc: org cleanup', r.status === 200, JSON.stringify(r.data));
+  r = await sa.req('DELETE', `/api/users/${zUserId}`);
+  check('zc: cleanup complete', r.status === 200, JSON.stringify(r.data));
+}
+
 // --- root sign-in page ---
 {
   const anon = client();
