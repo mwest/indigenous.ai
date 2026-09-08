@@ -40,11 +40,11 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 9 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied.length === 10 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
     applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids' &&
     applied[4].name === '005_corpora' && applied[5].name === '006_flat_roles' &&
     applied[6].name === '007_documents' && applied[7].name === '008_document_search_chunks' &&
-    applied[8].name === '009_default_collection',
+    applied[8].name === '009_default_collection' && applied[9].name === '010_optional_entry_campaign',
     JSON.stringify(applied));
   check('fresh: organization_memberships allows the translator role',
     tableSql(db, 'organization_memberships').includes('translator'));
@@ -138,7 +138,7 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
   check('legacy: all migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 9);
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 10);
   check('legacy: documents tables exist after upgrade',
     !!tableSql(db, 'documents') && !!tableSql(db, 'ingestion_jobs'));
   check('legacy: semantic chunk table + job type after upgrade',
@@ -149,6 +149,12 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
   check('legacy: sole corpus became the default collection',
     db.prepare(`SELECT COUNT(*) n FROM corpora WHERE organization_id = 1 AND is_default = 1`).get().n === 1 &&
     !!db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'idx_corpora_one_default_per_org'`).get());
+  // 010: entries.project_id is nullable; the rebuild preserved every row.
+  check('legacy: entries campaign became optional with data intact',
+    !/project_id\s+INTEGER\s+NOT NULL/.test(tableSql(db, 'entries')) &&
+    db.prepare(`SELECT COUNT(*) n FROM entries`).get().n === 2 &&
+    db.prepare(`SELECT dene_text FROM entries WHERE id = 1`).get().dene_text === 'ʔedlánet’é' &&
+    db.prepare(`SELECT COUNT(*) n FROM audio_files WHERE entry_id = 1`).get().n === 1);
   // 006: project roles flatten into org roles — the superadmin's owner grant
   // (001) is never downgraded; the plain member's project role becomes an org
   // role; the legacy memberships table survives as provenance.

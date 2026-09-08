@@ -1218,7 +1218,7 @@ async function loadEntryList() {
       <div class="dene">${esc(e.dene_text) || '<span class="placeholder">— no Dene yet —</span>'}</div>
       <div class="english">${esc(e.english_text) || '<span class="placeholder">— no English yet —</span>'}</div>
       <div class="entry-meta">
-        <span class="badge">${esc(e.project_name)}</span>
+        ${e.project_name ? `<span class="badge">${esc(e.project_name)}</span>` : ''}
         ${incomplete ? '<span class="badge incomplete">Needs translation</span>' : ''}
         ${e.category ? `<span class="badge">${esc(e.category)}</span>` : ''}
         ${e.audio_count ? `<span class="badge audio">♪ ${e.audio_count} · ${fmtDuration(e.audio_seconds)}</span>` : ''}
@@ -1248,25 +1248,24 @@ async function loadEntryList() {
 function renderNewEntry(kind = 'word') {
   const isPhrase = kind === 'phrase';
   const backHref = '#/entries';
-  // Content belongs to the collection; the campaign is only origin/provenance.
+  // Content belongs to the organization's Language collection; a campaign is
+  // OPTIONAL provenance (flat-collection spec §18) — manual additions need
+  // none.
   const campaigns = corpusProjects().filter((p) => p.status !== 'closed');
-  const ap = campaigns.find((p) => p.id === state.activeProjectId) ?? campaigns[0];
-  if (!ap) { location.hash = backHref; return; }
-  const corpus = activeCorpus();
 
   // Every entry — word or phrase — needs at least one side; the other can be
   // filled in later (the entry is flagged as needing translation).
   view.innerHTML = `
     <div class="page-head">
       <h1>New ${isPhrase ? 'phrase' : 'entry'}</h1>
-      <span class="page-context">${esc(corpus?.name ?? ap.name)}</span>
+      <span class="page-context">${esc(activeOrg()?.name ?? '')}</span>
     </div>
     <div class="card">
       <form id="entry-form">
-        ${campaigns.length > 1 ? `
-        <label class="field" style="max-width:340px"><span>Campaign (which funded program this work belongs to)</span>
-          <select name="project_id">${campaigns.map((p) =>
-            `<option value="${p.id}" ${p.id === ap.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>` : ''}
+        ${campaigns.length ? `
+        <label class="field" style="max-width:340px"><span>Campaign (optional — which funded program this belongs to)</span>
+          <select name="project_id"><option value="">— none —</option>${campaigns.map((p) =>
+            `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>` : ''}
         <p class="form-hint">Enter the Dene ${isPhrase ? 'phrase' : 'word'}, the English, or both. If you enter only one, it will be queued for translation.</p>
         <label class="field"><span>${isPhrase ? 'Dene phrase' : 'Dene text'}</span>
           <input type="text" name="dene_text" id="dene-input" class="dene" lang="den" spellcheck="false"></label>
@@ -1299,7 +1298,8 @@ function renderNewEntry(kind = 'word') {
       const entry = await api('/entries', {
         method: 'POST',
         body: {
-          project_id: Number(f.project_id?.value ?? ap.id),
+          project_id: f.project_id?.value ? Number(f.project_id.value) : undefined,
+          organization_id: activeOrg()?.id,
           kind,
           dene_text: f.dene_text.value,
           english_text: f.english_text.value,
@@ -1395,7 +1395,7 @@ async function renderEntryDetail(id) {
     <div class="card">
       <form id="entry-form">
         <div class="entry-meta" style="margin-bottom:0.8rem">
-          <span class="badge">${esc(entry.project_name)}${entry.dialect ? ` — ${esc(entry.dialect)}` : ''}</span>
+          ${entry.project_name ? `<span class="badge">${esc(entry.project_name)}${entry.dialect ? ` — ${esc(entry.dialect)}` : ''}</span>` : ''}
           ${incomplete ? '<span class="badge incomplete">Needs translation</span>' : ''}
           <span>created by ${esc(entry.created_by_name)} on ${fmtDate(entry.created_at)}</span>
           <span>last edited by ${esc(entry.updated_by_name)} on ${fmtDate(entry.updated_at)}</span>

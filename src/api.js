@@ -1137,8 +1137,9 @@ language.post('/documents/:id/create-entries', loadDocument({ upload: true }), (
   if (projectId && !campaigns.includes(projectId)) {
     return bad(res, 'That project is not an open campaign on this collection');
   }
-  if (!projectId) projectId = campaigns[0];
-  if (!projectId) return bad(res, 'This collection has no open project to attribute the entries to');
+  // Campaign is optional provenance (flat-collection spec §18): default to
+  // the collection's open campaign when one exists, else import campaign-less.
+  if (!projectId) projectId = campaigns[0] ?? null;
 
   const version = documents.currentVersion(doc.id);
   const where = ['document_version_id = ?', `block_type = 'sheet_row'`];
@@ -1675,7 +1676,7 @@ const entrySelect = `
          (SELECT COALESCE(SUM(a.duration_seconds), 0) FROM audio_files a
             WHERE a.entry_id = e.id AND a.is_current = 1) AS audio_seconds
   FROM entries e
-  JOIN projects p ON p.id = e.project_id
+  LEFT JOIN projects p ON p.id = e.project_id
   JOIN users cu ON cu.id = e.created_by
   JOIN users uu ON uu.id = e.updated_by
 `;
@@ -1900,16 +1901,34 @@ function applyTranslation(entry, nextDene, nextEnglish, userId) {
 }
 
 language.post('/entries', (req, res) => {
-  const { project_id, dene_text, english_text, source_doc, notes, category } = req.body ?? {};
-  const projectId = Number(project_id);
-  const role = roleIn(req.user, projectId);
-  if (!projectId || !role) {
-    return bad(res, 'You are not a member of that project', 403);
+  const { project_id, organization_id, dene_text, english_text, source_doc, notes, category } = req.body ?? {};
+  // An entry belongs to its organization's Language collection; the campaign
+  // is OPTIONAL provenance (flat-collection spec §18). With a campaign, the
+  // caller needs a non-translator role on it; without one, a non-translator
+  // org role — the entry lands in the default collection, campaign-less.
+  const projectId = project_id ? Number(project_id) : null;
+  let corpusId;
+  if (projectId) {
+    const role = roleIn(req.user, projectId);
+    if (!role) return bad(res, 'You are not a member of that campaign', 403);
+    if (role === 'translator') return bad(res, 'Translators add recordings, not entries', 403);
+    if (!requireLanguageForOrg(res, orgOfProject(db, projectId))) return;
+    corpusId = db.prepare('SELECT corpus_id FROM projects WHERE id = ?').get(projectId).corpus_id;
+  } else {
+    const memberOrgs = orgsFor(req.user).filter((o) => o.role && o.role !== 'translator');
+    let orgId = organization_id ? Number(organization_id) : null;
+    if (orgId) {
+      if (!memberOrgs.some((o) => o.id === orgId)) return bad(res, 'Not a member of that organization', 403);
+    } else if (memberOrgs.length === 1) {
+      orgId = memberOrgs[0].id;
+    } else {
+      return bad(res, memberOrgs.length
+        ? 'You belong to multiple organizations — specify organization_id'
+        : 'Organization membership required', memberOrgs.length ? 400 : 403);
+    }
+    if (!requireLanguageForOrg(res, orgId)) return;
+    corpusId = defaultCorpusFor(db, orgId).id;
   }
-  if (role === 'translator') {
-    return bad(res, 'Translators add recordings, not entries', 403);
-  }
-  if (!requireLanguageForOrg(res, orgOfProject(db, projectId))) return;
   const kind = req.body?.kind === 'phrase' ? 'phrase' : 'word';
   const dene = dene_text?.trim() || '';
   const english = english_text?.trim() || '';
@@ -1920,9 +1939,9 @@ language.post('/entries', (req, res) => {
   const info = db
     .prepare(
       `INSERT INTO entries (uid, project_id, corpus_id, kind, dene_text, english_text, source_doc, notes, category, created_by, updated_by)
-       VALUES (?, ?, (SELECT corpus_id FROM projects WHERE id = ?), ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(uuidv7(), projectId, projectId, kind, dene, english, source_doc?.trim() || null,
+    .run(uuidv7(), projectId, corpusId, kind, dene, english, source_doc?.trim() || null,
          notes?.trim() || null, category?.trim() || null, req.user.id, req.user.id);
   syncEntryTexts(db, info.lastInsertRowid, req.user.id);
   storeEmbedding(info.lastInsertRowid, english);
@@ -2085,7 +2104,7 @@ function saveMasterRecording({ entry, userId, file, probe, sha256 = null, langua
   // their self-speaker in the project's organization. uploaded_by stays as
   // the facilitator/provenance either way.
   if (!speakerId) {
-    const orgId = orgOfProject(db, entry.project_id);
+    const orgId = orgOfEntry(entry); // corpus-first: works for campaign-less entries
     if (orgId) speakerId = selfSpeakerFor(db, orgId, userId);
   }
   const prior = db
@@ -2375,7 +2394,10 @@ language.get('/audio/:id/history', loadAudio, (req, res) => {
 // a separate, explicit action under the owner's policy.
 language.post('/audio/:id/revoke', loadAudio, (req, res) => {
   const org = db
-    .prepare('SELECT p.organization_id AS oid FROM entries e JOIN projects p ON p.id = e.project_id WHERE e.id = ?')
+    .prepare(`SELECT COALESCE(
+        (SELECT organization_id FROM corpora c WHERE c.id = e.corpus_id),
+        (SELECT organization_id FROM projects p WHERE p.id = e.project_id)) AS oid
+      FROM entries e WHERE e.id = ?`)
     .get(req.audio.entry_id);
   if (!org?.oid || !isOrgAdmin(req.user, org.oid)) {
     return bad(res, 'Organization admin access required', 403);
@@ -2421,7 +2443,10 @@ language.delete('/audio/:id', loadAudio, (req, res) => {
     .get(a.entry_id, a.language, a.uploaded_by);
   if (billed) {
     const org = db
-      .prepare(`SELECT p.organization_id AS oid FROM entries e JOIN projects p ON p.id = e.project_id WHERE e.id = ?`)
+      .prepare(`SELECT COALESCE(
+          (SELECT organization_id FROM corpora c WHERE c.id = e.corpus_id),
+          (SELECT organization_id FROM projects p WHERE p.id = e.project_id)) AS oid
+        FROM entries e WHERE e.id = ?`)
       .get(a.entry_id);
     if (!org?.oid || !isOrgAdmin(req.user, org.oid)) {
       return bad(res, 'This recording is billed work — an organization admin must delete it (or authorize a paid re-record)', 403);
