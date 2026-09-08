@@ -409,6 +409,11 @@ function roleForEntry(user, entry) {
   if (direct === 'admin' || !entry.corpus_id) return direct;
   const rank = { admin: 3, member: 2, translator: 1 };
   let best = direct;
+  // Flat model: ORG membership carries corpus authority even when the org has
+  // zero campaigns (roleForCorpus derives from the org role) — campaign roles
+  // remain as the legacy fallback for pre-flat grants.
+  const viaOrg = roleForCorpus(user, entry.corpus_id);
+  if ((rank[viaOrg] ?? 0) > (rank[best] ?? 0)) best = viaOrg;
   for (const p of projectsFor(user)) {
     if (p.corpus_id === entry.corpus_id && (rank[p.role] ?? 0) > (rank[best] ?? 0)) best = p.role;
   }
@@ -1689,10 +1694,14 @@ language.get('/entries', async (req, res) => {
   // (two-fixes #2): entries belong to corpora; a campaign's view is its whole
   // corpus — including entries created by sibling campaigns. Legacy rows
   // without a corpus fall back to their origin project.
+  // Visibility is ORG-derived (flat-collection spec §17): every collection of
+  // the caller's entitled organizations is browseable — campaigns are not the
+  // gate, and an org with ZERO campaigns still shows its collection. Campaign
+  // membership remains only as the legacy fallback for corpus-less rows.
   const visibleProjects = entitledProjectsFor(req.user);
-  if (visibleProjects.length === 0) return res.json({ entries: [], total: 0 });
   const visibleIds = visibleProjects.map((p) => p.id);
-  const visibleCorpora = [...new Set(visibleProjects.map((p) => p.corpus_id).filter(Boolean))];
+  const visibleCorpora = [...visibleCorpusIds(req.user)];
+  if (!visibleCorpora.length && !visibleIds.length) return res.json({ entries: [], total: 0 });
 
   const q = String(req.query.q ?? '').trim();
   // Smart search: embed up front so an embedding failure degrades to keyword
@@ -1731,8 +1740,10 @@ language.get('/entries', async (req, res) => {
       scope.push(`e.corpus_id IN (${visibleCorpora.map(() => '?').join(',')})`);
       params.push(...visibleCorpora);
     }
-    scope.push(`(e.corpus_id IS NULL AND e.project_id IN (${visibleIds.map(() => '?').join(',')}))`);
-    params.push(...visibleIds);
+    if (visibleIds.length) {
+      scope.push(`(e.corpus_id IS NULL AND e.project_id IN (${visibleIds.map(() => '?').join(',')}))`);
+      params.push(...visibleIds);
+    }
     where.push(`(${scope.join(' OR ')})`);
   }
 
