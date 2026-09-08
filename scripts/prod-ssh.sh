@@ -24,10 +24,13 @@ KEY="$HOME/.fly-ssh/dene"
 PORT="${FLY_SSH_PORT:-10022}"
 
 # 1. Ensure a usable cert. Certs are time-limited (72h); re-issue if the cert is
-#    missing or older than 60h, leaving a safety margin.
+#    missing or older than 60h, leaving a safety margin. Remove the old files
+#    first: flyctl's --overwrite still stalls in an interactive "File exists"
+#    prompt loop when stdin is not a TTY, which hangs non-interactive callers.
 if [ ! -f "$KEY" ] || [ ! -f "$KEY-cert.pub" ] || find "$KEY-cert.pub" -mmin +3600 2>/dev/null | grep -q .; then
   mkdir -p "$(dirname "$KEY")"
-  "$FLY" ssh issue personal "$KEY" --overwrite --hours 72 -u root >/dev/null
+  rm -f "$KEY" "$KEY-cert.pub"
+  "$FLY" ssh issue personal "$KEY" --hours 72 -u root >/dev/null
   chmod 600 "$KEY" "$KEY-cert.pub"
 fi
 
