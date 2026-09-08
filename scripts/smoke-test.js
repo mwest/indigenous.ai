@@ -2385,6 +2385,32 @@ if (BASE.includes('localhost')) {
     (await owner.req('GET', `/api/entries/${entryX}`)).status === 200,
     JSON.stringify(r.data));
 
+  // §43 Manual content WITHOUT a campaign (spec §14/§18): admins/members add
+  // entries with no campaign; they land in the default collection with null
+  // provenance and behave like any other entry.
+  r = await owner.req('POST', '/api/entries', { kind: 'word', dene_text: 'béré', english_text: 'bread' });
+  check('flat: entry created without a campaign (sole org inferred)',
+    r.status === 201 && r.data.project_id === null, JSON.stringify(r.data.project_id ?? r.data));
+  const freeEntry = r.data.id;
+  check('flat: campaign-less entry lives in the default collection',
+    db.prepare('SELECT corpus_id FROM entries WHERE id = ?').get(freeEntry).corpus_id === defCorpus.id);
+  check('flat: campaign-less entry mirrors both entry_texts',
+    db.prepare('SELECT COUNT(*) n FROM entry_texts WHERE entry_id = ?').get(freeEntry).n === 2,
+    db.prepare('SELECT COUNT(*) n FROM entry_texts WHERE entry_id = ?').get(freeEntry).n);
+  r = await owner.req('GET', `/api/search?corpus_id=${defCorpus.id}&q=bread`);
+  check('flat: campaign-less entry is searchable', r.data.entries.results.some((e) => e.id === freeEntry));
+  r = await owner.req('GET', `/api/entries/${freeEntry}`);
+  check('flat: campaign-less entry readable with null campaign provenance',
+    r.status === 200 && r.data.project_name === null && r.data.can_edit === true,
+    JSON.stringify({ p: r.data.project_name, e: r.data.can_edit }));
+  let cfd = new FormData();
+  cfd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'free.wav');
+  cfd.append('language', 'dene');
+  r = await owner.req('POST', `/api/entries/${freeEntry}/audio`, cfd, true);
+  check('flat: recording on a campaign-less entry resolves its org via the corpus',
+    r.status === 201 && !!r.data.speaker_id, JSON.stringify({ s: r.status, sp: r.data?.speaker_id }));
+  await owner.req('DELETE', `/api/entries/${freeEntry}`);
+
   // The frontend derives the collection from /corpora's default flag.
   r = await owner.req('GET', '/api/corpora');
   check('flat: /corpora marks the default collection',

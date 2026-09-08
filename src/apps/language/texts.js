@@ -58,8 +58,8 @@ export function varietyForDialect(db, dialect) {
 export function syncEntryTexts(db, entryId, userId) {
   const entry = db.prepare(
     `SELECT e.id, e.dene_text, e.english_text, p.dialect
-     FROM entries e JOIN projects p ON p.id = e.project_id WHERE e.id = ?`
-  ).get(entryId);
+     FROM entries e LEFT JOIN projects p ON p.id = e.project_id WHERE e.id = ?`
+  ).get(entryId); // campaign-less entries mirror with the default (null-dialect) variety
   if (!entry) return;
   const { englishVarietyId } = ensureLanguageSeeds(db);
 
