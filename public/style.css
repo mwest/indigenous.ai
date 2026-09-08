@@ -96,15 +96,23 @@ body {
 
 @media (max-width: 900px) {
   #nav-toggle { display: inline-block; }
+  /* The app bar wraps taller than 52px on narrow screens, so the drawer
+     overlays from the very top (above the bar, z-index over its 30) — the
+     Organization context at its head must never hide under the bar. */
   #sidebar {
-    position: fixed; left: 0; top: 52px; bottom: 0; z-index: 20;
+    position: fixed; left: 0; top: 0; bottom: 0; z-index: 40;
     max-height: none; height: auto;
     box-shadow: 4px 0 18px rgba(0,0,0,0.15);
     transform: translateX(-105%);
     transition: transform 0.18s ease;
   }
+  #sidebar-backdrop { z-index: 39; }
   #shell.nav-open #sidebar { transform: translateX(0); }
   #sidebar a { padding: 0.6rem 0.7rem; } /* touch targets */
+  /* Keep the bar itself to one compact row. */
+  #appbar { gap: 0.5rem; padding: 0.55rem 0.7rem; }
+  .brand { font-size: 0.95rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #appbar .user-menu button { white-space: nowrap; }
 }
 @media (min-width: 901px) {
   #sidebar-backdrop { display: none !important; }
