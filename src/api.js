@@ -12,6 +12,7 @@ import { syncEntryTexts, varietyForDialect } from './apps/language/texts.js';
 import { parseCsv } from './apps/language/csv.js';
 import * as documents from './apps/language/documents/service.js';
 import { masterSearch, homeFeed } from './apps/language/search/service.js';
+import { defaultCorpusFor } from './apps/language/corpus.js';
 import { DOCUMENTS_DIR } from './apps/language/documents/storage.js';
 import { selfSpeakerFor, orgOfProject } from './apps/language/speakers.js';
 import { organizationHasApp, entitledOrgIds } from './platform/entitlements.js';
@@ -432,6 +433,8 @@ platform.put('/orgs/:id/apps/:code', requireSuperadmin, (req, res) => {
        status = excluded.status,
        disabled_at = CASE WHEN excluded.status = 'disabled' THEN datetime('now') END`
   ).run({ org: org.id, code, status });
+  // Enabling Language guarantees the default collection exists (spec §6).
+  if (code === 'language' && status === 'enabled') defaultCorpusFor(db, org.id);
   res.json({ ok: true, app_code: code, status });
 });
 
@@ -526,9 +529,12 @@ platform.post('/orgs', requireSuperadmin, (req, res) => {
       const i = db.prepare('INSERT INTO organizations (uid, name, slug) VALUES (?, ?, ?)').run(uuidv7(), name, slug);
       db.prepare('INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)')
         .run(i.lastInsertRowid, owner.id, 'owner_admin');
-      // Language is currently the only application; new tenants start with it.
+      // Language is currently the only application; new tenants start with it,
+      // and the default Language collection exists from day one — nobody has
+      // to create or name it (flat-collection spec §6).
       db.prepare(`INSERT INTO organization_apps (organization_id, app_code) VALUES (?, 'language')`)
         .run(i.lastInsertRowid);
+      defaultCorpusFor(db, i.lastInsertRowid);
       return i;
     })();
     res.status(201).json(db.prepare('SELECT * FROM organizations WHERE id = ?').get(info.lastInsertRowid));
@@ -618,11 +624,27 @@ platform.delete('/orgs/:id', (req, res) => {
   if (!org) return bad(res, 'Organization not found', 404);
   if (orgRole(req.user, org.id) !== 'owner_admin') return bad(res, 'Organization owner access required', 403);
   if (db.prepare('SELECT 1 FROM projects WHERE organization_id = ? LIMIT 1').get(org.id)) {
-    return bad(res, 'This organization still owns projects — move or delete them first');
+    return bad(res, 'This organization still owns campaigns — move or delete them first');
+  }
+  // The default Language collection (and any other corpus) goes with the org,
+  // but only once it holds no content — language data is never deleted as a
+  // side effect of tenancy cleanup.
+  const contentful = db.prepare(
+    `SELECT 1 FROM corpora c WHERE c.organization_id = ? AND (
+       EXISTS (SELECT 1 FROM entries e WHERE e.corpus_id = c.id) OR
+       EXISTS (SELECT 1 FROM documents d WHERE d.corpus_id = c.id)) LIMIT 1`
+  ).get(org.id);
+  if (contentful) {
+    return bad(res, 'This organization still owns language content — export and remove it first');
   }
   db.transaction(() => {
     db.prepare('UPDATE work_log SET organization_id = NULL WHERE organization_id = ?').run(org.id);
     db.prepare('UPDATE payments SET organization_id = NULL WHERE organization_id = ?').run(org.id);
+    // Speaker identities are org-scoped; with no content left (checked above)
+    // nothing references them, so they and their session records go too.
+    db.prepare(`DELETE FROM recording_sessions WHERE speaker_id IN (SELECT id FROM speakers WHERE organization_id = ?)`).run(org.id);
+    db.prepare('DELETE FROM speakers WHERE organization_id = ?').run(org.id);
+    db.prepare('DELETE FROM corpora WHERE organization_id = ?').run(org.id);
     db.prepare('DELETE FROM organizations WHERE id = ?').run(org.id);
   })();
   res.json({ ok: true });
@@ -819,7 +841,7 @@ language.get('/corpora', (req, res) => {
   const ph = orgIds.map(() => '?').join(',');
   const corpora = db
     .prepare(
-      `SELECT c.id, c.uid, c.organization_id, c.name, c.primary_variety_id,
+      `SELECT c.id, c.uid, c.organization_id, c.name, c.primary_variety_id, c.is_default,
               (SELECT COUNT(*) FROM projects p WHERE p.corpus_id = c.id) AS project_count,
               (SELECT COUNT(*) FROM projects p WHERE p.corpus_id = c.id AND p.status = 'active') AS active_project_count,
               (SELECT COUNT(*) FROM entries e WHERE e.corpus_id = c.id) AS entry_count,
@@ -1204,24 +1226,27 @@ language.post('/projects', (req, res) => {
     return bad(res, 'You administer multiple organizations — specify organization_id');
   }
   if (!requireLanguageForOrg(res, orgId)) return;
-  // Corpus / campaign separation (plan §10): the corpus is the permanent home
-  // of the language data; this project is a campaign of work on it. Pass
-  // corpus_id to add a new campaign to an EXISTING corpus (same org);
-  // otherwise a corpus is created alongside the project.
-  let corpusId = req.body?.corpus_id ? Number(req.body.corpus_id) : null;
-  if (corpusId) {
+  // Flat collection (spec §10/§11): a campaign is funded WORK on the
+  // organization's one Language collection — it never gets a collection of
+  // its own. Multi-corpus remains superadmin/dev tooling only (spec §32):
+  // corpus_id targets an existing corpus, new_corpus:true creates an
+  // isolated one (the regression suite's separate worlds).
+  let corpusId = null;
+  if (req.user.is_superadmin && req.body?.corpus_id) {
+    corpusId = Number(req.body.corpus_id);
     const corpus = db.prepare('SELECT organization_id FROM corpora WHERE id = ?').get(corpusId);
     if (!corpus || corpus.organization_id !== orgId) return bad(res, 'Corpus not found in that organization');
   }
   try {
     const info = db.transaction(() => {
-      if (!corpusId) {
+      if (!corpusId && req.user.is_superadmin && req.body?.new_corpus === true) {
         corpusId = db.prepare(
           `INSERT INTO corpora (uid, organization_id, name, primary_variety_id)
            VALUES (?, ?, ?, ?)`
         ).run(uuidv7(), orgId, String(name).trim(),
               varietyForDialect(db, dialect || null)).lastInsertRowid;
       }
+      if (!corpusId) corpusId = defaultCorpusFor(db, orgId).id;
       return db
         .prepare('INSERT INTO projects (uid, name, dialect, description, organization_id, corpus_id) VALUES (?, ?, ?, ?, ?, ?)')
         .run(uuidv7(), String(name).trim(), dialect || null, description || null, orgId, corpusId);
@@ -1265,11 +1290,26 @@ language.delete('/projects/:id', requireOrgAdminOfProject, (req, res) => {
   if (confirm_name !== project.name) {
     return bad(res, 'Type the exact project name to confirm deletion');
   }
-  // Corpus invariant (plan §10): a campaign that shares its corpus with other
-  // campaigns cannot be deleted — its entries are corpus property that the
-  // sibling campaigns still work on. Close it instead. A corpus's ONLY
-  // campaign keeps today's explicit destroy-everything semantics (the owner
-  // deleting the whole corpus, name-confirmed).
+  // Flat collection (spec §11/§37): a campaign on the organization's DEFAULT
+  // collection is work/funding administration — deleting it removes the
+  // campaign only, and is refused while permanent content or paid work still
+  // cites it as origin (provenance must survive; close the campaign instead).
+  const corpusRow = project.corpus_id
+    ? db.prepare('SELECT is_default FROM corpora WHERE id = ?').get(project.corpus_id)
+    : null;
+  if (corpusRow?.is_default) {
+    const cited = db.prepare('SELECT COUNT(*) n FROM entries WHERE project_id = ?').get(project.id).n;
+    const work = db.prepare('SELECT COUNT(*) n FROM work_items WHERE project_id = ?').get(project.id).n;
+    if (cited > 0 || work > 0) {
+      return bad(res, `This campaign is the origin of ${cited} entr${cited === 1 ? 'y' : 'ies'} and ${work} work item${work === 1 ? '' : 's'} — close it instead of deleting it`);
+    }
+    db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
+    return res.json({ ok: true, deleted_entries: 0, deleted_recordings: 0 });
+  }
+
+  // Legacy/isolated corpora (superadmin/dev tooling, spec §32) keep the old
+  // semantics: a campaign that shares its corpus with others cannot be
+  // deleted; a corpus's ONLY campaign destroys the whole corpus with it.
   const siblings = project.corpus_id
     ? db.prepare('SELECT COUNT(*) n FROM projects WHERE corpus_id = ? AND id <> ?')
         .get(project.corpus_id, project.id).n
