@@ -40,10 +40,11 @@ check('fresh: apply exits 0', r.status === 0, r.stderr);
   const db = open(freshDir);
   const applied = db.prepare('SELECT * FROM schema_migrations ORDER BY version').all();
   check('fresh: migrations recorded in schema_migrations',
-    applied.length === 8 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
+    applied.length === 9 && applied[0].name === '001_baseline' && applied[1].name === '002_languages' &&
     applied[2].name === '003_speakers_sessions' && applied[3].name === '004_stable_uids' &&
     applied[4].name === '005_corpora' && applied[5].name === '006_flat_roles' &&
-    applied[6].name === '007_documents' && applied[7].name === '008_document_search_chunks',
+    applied[6].name === '007_documents' && applied[7].name === '008_document_search_chunks' &&
+    applied[8].name === '009_default_collection',
     JSON.stringify(applied));
   check('fresh: organization_memberships allows the translator role',
     tableSql(db, 'organization_memberships').includes('translator'));
@@ -137,13 +138,17 @@ check('legacy: apply exits 0', r.status === 0, r.stderr);
 {
   const db = open(legacyDir);
   check('legacy: all migrations recorded',
-    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 8);
+    db.prepare(`SELECT COUNT(*) n FROM schema_migrations`).get().n === 9);
   check('legacy: documents tables exist after upgrade',
     !!tableSql(db, 'documents') && !!tableSql(db, 'ingestion_jobs'));
   check('legacy: semantic chunk table + job type after upgrade',
     !!tableSql(db, 'document_search_chunks') &&
     tableSql(db, 'ingestion_jobs').includes('semantic_index') &&
     tableSql(db, 'document_versions').includes('semantic_status'));
+  // 009: the legacy project's corpus (created by 005) becomes the org default.
+  check('legacy: sole corpus became the default collection',
+    db.prepare(`SELECT COUNT(*) n FROM corpora WHERE organization_id = 1 AND is_default = 1`).get().n === 1 &&
+    !!db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'idx_corpora_one_default_per_org'`).get());
   // 006: project roles flatten into org roles — the superadmin's owner grant
   // (001) is never downgraded; the plain member's project role becomes an org
   // role; the legacy memberships table survives as provenance.

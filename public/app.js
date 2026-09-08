@@ -46,9 +46,11 @@ const state = {
   me: null,          // { user, projects, orgs }
   corpora: [],       // visible collections (GET /corpora)
   activeOrgId: Number(localStorage.getItem('activeOrgId')) || null,
-  activeCorpusId: Number(localStorage.getItem('activeCorpusId')) || null,
+  // Work context only (flat-collection spec §34): the campaign matters inside
+  // Record/Translate flows, never for browsing.
   activeProjectId: Number(localStorage.getItem('activeProjectId')) || null,
 };
+localStorage.removeItem('activeCorpusId'); // pre-flattening selector state (spec §33)
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $('#view');
@@ -102,8 +104,8 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
 }
 
-// The active ORGANIZATION scopes the whole top bar: its name is the brand,
-// and the project switcher offers only its projects.
+// The active ORGANIZATION is the only persistent context (flat-collection
+// spec §1): its Language collection and campaigns derive from it.
 function activeOrg() {
   const orgs = state.me?.orgs ?? [];
   return orgs.find((o) => o.id === state.activeOrgId) || orgs[0] || null;
@@ -116,31 +118,21 @@ function orgProjects() {
   return org ? projects.filter((p) => p.organization_id === org.id) : projects;
 }
 
-// The active CORPUS ("Collection" in the UI) is the content context for the
-// Library (nav spec §7): Entries, Recordings, Speakers browse the corpus.
-// Projects/campaigns scope only funded WORK.
+// Flat collection (flat-collection spec §1/§7): the organization's Language
+// collection is DERIVED from the active organization, never user-selected.
+// The corpus stays an internal implementation detail.
 function orgCorpora() {
   const org = activeOrg();
   return org ? state.corpora.filter((c) => c.organization_id === org.id) : [];
 }
 
+/** The active organization's default Language collection. */
 function activeCorpus() {
   const corpora = orgCorpora();
-  return corpora.find((c) => c.id === state.activeCorpusId) || corpora[0] || null;
+  return corpora.find((c) => c.is_default) || corpora[0] || null;
 }
 
-function setActiveCorpus(id) {
-  state.activeCorpusId = Number(id);
-  localStorage.setItem('activeCorpusId', state.activeCorpusId);
-  // Keep the active campaign on this corpus where possible.
-  const inCorpus = corpusProjects();
-  if (!inCorpus.some((p) => p.id === state.activeProjectId)) {
-    state.activeProjectId = inCorpus[0]?.id ?? orgProjects()[0]?.id ?? null;
-    localStorage.setItem('activeProjectId', state.activeProjectId ?? '');
-  }
-}
-
-/** Campaigns operating on the active corpus. */
+/** Campaigns operating on the active collection. */
 function corpusProjects() {
   const corpus = activeCorpus();
   return corpus ? orgProjects().filter((p) => p.corpus_id === corpus.id) : orgProjects();
@@ -149,12 +141,10 @@ function corpusProjects() {
 function setActiveOrg(id) {
   state.activeOrgId = Number(id);
   localStorage.setItem('activeOrgId', state.activeOrgId);
-  // Reset corpus + campaign into the new organization.
-  const corpora = orgCorpora();
-  if (!corpora.some((c) => c.id === state.activeCorpusId)) {
-    setActiveCorpus(corpora[0]?.id ?? null);
-  } else {
-    setActiveCorpus(state.activeCorpusId);
+  // Campaign context belongs to the old organization — reset it (spec §35).
+  if (!orgProjects().some((p) => p.id === state.activeProjectId)) {
+    state.activeProjectId = corpusProjects()[0]?.id ?? orgProjects()[0]?.id ?? null;
+    localStorage.setItem('activeProjectId', state.activeProjectId ?? '');
   }
 }
 
@@ -400,11 +390,11 @@ function renderShell() {
 
   const orgs = state.me.orgs;
   const org = activeOrg();
-  const corpora = orgCorpora();
-  const corpus = activeCorpus();
   const translator = isTranslator();
   const admin = isActiveOrgAdmin();
 
+  // One persistent context: the Organization (flat-collection spec §1). Its
+  // Language collection is resolved automatically — no Corpus selector.
   const contextHtml = `
     <div class="nav-context">
       <label>Organization
@@ -413,13 +403,6 @@ function renderShell() {
               `<option value="${o.id}" ${o.id === org?.id ? 'selected' : ''}>${esc(o.name)}</option>`).join('')}</select>`
           : `<span class="context-fixed">${esc(org?.name ?? 'indigenous.ai')}</span>`}
       </label>
-      ${corpora.length ? `
-      <label>Collection
-        ${corpora.length > 1
-          ? `<select id="corpus-switcher">${corpora.map((c) =>
-              `<option value="${c.id}" ${c.id === corpus?.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>`
-          : `<span class="context-fixed">${esc(corpus?.name ?? '')}</span>`}
-      </label>` : ''}
     </div>`;
 
   const sections = [];
@@ -440,12 +423,14 @@ function renderShell() {
       ${navLink('#/documents', 'Documents')}</div>`);
     sections.push(`<div class="nav-section"><h3>Work</h3>
       ${navLink('#/record', 'Record')}
-      ${navLink('#/translate', 'Translate')}
-      ${admin ? navLink('#/projects', 'Projects') : ''}</div>`);
+      ${navLink('#/translate', 'Translate')}</div>`);
     if (admin) {
+      // Campaigns are work/funding administration, not a content concept
+      // (flat-collection spec §15/§16) — they live under Manage.
       sections.push(`<div class="nav-section"><h3>Manage</h3>
         ${navLink('#/people', 'People')}
         ${navLink('#/compensation', 'Compensation')}
+        ${navLink('#/projects', 'Campaigns')}
         ${navLink('#/consent', 'Consent')}</div>`);
     }
   }
@@ -459,13 +444,6 @@ function renderShell() {
 
   $('#org-switcher')?.addEventListener('change', (e) => {
     setActiveOrg(e.target.value);
-    listState.contributor = '';
-    listState.offset = 0;
-    renderShell();
-    route();
-  });
-  $('#corpus-switcher')?.addEventListener('change', (e) => {
-    setActiveCorpus(e.target.value);
     listState.contributor = '';
     listState.offset = 0;
     renderShell();
@@ -969,10 +947,10 @@ async function renderCompensationDetail(id) {
     </div>
 
     <div class="card">
-      <h2 style="margin-top:0">Rates per project</h2>
+      <h2 style="margin-top:0">Rates per campaign</h2>
       ${d.projects.length ? `
       <div class="table-wrap"><table>
-        <thead><tr><th>Project</th><th>Translation (each)</th><th>Recording (each)</th></tr></thead>
+        <thead><tr><th>Campaign</th><th>Translation (each)</th><th>Recording (each)</th></tr></thead>
         <tbody>
           ${d.projects.map((p) => `
             <tr>
@@ -985,7 +963,7 @@ async function renderCompensationDetail(id) {
         </tbody>
       </table></div>
       <p class="palette-hint">Changing a rate only affects work logged from then on; past earnings keep the rate they were logged at.</p>
-      ` : '<p style="color:var(--muted)">This person isn\'t a member of any project yet.</p>'}
+      ` : '<p style="color:var(--muted)">This person isn\'t part of any campaign yet.</p>'}
     </div>
 
     <div class="card">
@@ -1023,7 +1001,7 @@ async function renderCompensationDetail(id) {
       <h2 style="margin-top:0">Work log</h2>
       ${d.work.length ? `
       <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Type</th><th>Project</th><th>Detail</th><th>Amount</th></tr></thead>
+        <thead><tr><th>Date</th><th>Type</th><th>Campaign</th><th>Detail</th><th>Amount</th></tr></thead>
         <tbody>
           ${d.work.map((w) => `
             <tr>
@@ -1286,7 +1264,7 @@ function renderNewEntry(kind = 'word') {
     <div class="card">
       <form id="entry-form">
         ${campaigns.length > 1 ? `
-        <label class="field" style="max-width:340px"><span>Project (which campaign this work belongs to)</span>
+        <label class="field" style="max-width:340px"><span>Campaign (which funded program this work belongs to)</span>
           <select name="project_id">${campaigns.map((p) =>
             `<option value="${p.id}" ${p.id === ap.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>` : ''}
         <p class="form-hint">Enter the Dene ${isPhrase ? 'phrase' : 'word'}, the English, or both. If you enter only one, it will be queued for translation.</p>
@@ -1744,7 +1722,7 @@ function audioItemHtml(a, entry) {
 async function renderTranslatorDashboard() {
   const p = activeProject();
   if (!p) {
-    view.innerHTML = `<div class="empty">You are not a member of any project yet.<br>
+    view.innerHTML = `<div class="empty">You are not part of any campaign yet.<br>
       Ask your organization’s administrator to add you.</div>`;
     return;
   }
@@ -1808,7 +1786,7 @@ async function renderMyEarnings() {
       <h2 style="margin-top:0">Work log</h2>
       ${d.work.length ? `
       <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Type</th><th>Project</th><th>Detail</th><th>Amount</th></tr></thead>
+        <thead><tr><th>Date</th><th>Type</th><th>Campaign</th><th>Detail</th><th>Amount</th></tr></thead>
         <tbody>
           ${d.work.map((w) => `
             <tr>
@@ -1932,9 +1910,9 @@ function chooseCampaign(container, expectedHash) {
     const current = campaigns.find((p) => p.id === state.activeProjectId) ?? campaigns[0];
     container.innerHTML = `
       <div class="card preflight">
-        <h2 style="margin-top:0">Project</h2>
-        <p class="preflight-hint">Which project (campaign) is this work session for?</p>
-        <label class="field"><span>Project / campaign</span>
+        <h2 style="margin-top:0">Campaign</h2>
+        <p class="preflight-hint">Which campaign is this work session for?</p>
+        <label class="field"><span>Campaign</span>
           <select id="wk-campaign">${campaigns.map((p) =>
             `<option value="${p.id}" ${p.id === current.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
         <div class="rec-actions">
@@ -2276,8 +2254,8 @@ async function renderHome(searchQ = '') {
   if (!corpus) {
     view.innerHTML = `<div class="empty">
       ${isOrgAdmin()
-        ? 'No collection yet — create your first project to start one.<br><br><a class="btn" href="#/projects">Go to Projects</a>'
-        : 'You are not part of a collection yet.<br>Ask your organization’s administrator to add you.'}
+        ? 'This organization has no Language collection yet — it is created automatically when the Language app is enabled.<br><br>Contact your platform administrator.'
+        : 'You are not part of an organization yet.<br>Ask your organization’s administrator to add you.'}
     </div>`;
     return;
   }
@@ -2287,7 +2265,7 @@ async function renderHome(searchQ = '') {
   const c = activeCorpus() ?? corpus;
   view.innerHTML = `
     <div class="page-head">
-      <h1>${esc(c.name)}</h1>
+      <h1>${esc(activeOrg()?.name ?? c.name)}</h1>
       <div class="head-actions">
         ${isTranslator() ? '' : `<a class="btn secondary small" href="#/entries/new?kind=word">＋ Add entry</a>`}
         <a class="btn small" href="#/record">⏺ Start recording</a>
@@ -2308,8 +2286,8 @@ async function renderHome(searchQ = '') {
       ${isTranslator() ? '' : `<a href="#/documents"><div class="stat-tile"><div class="num">${c.document_count ?? 0}</div><div class="lbl">Documents</div></div></a>`}
     </div>
     ${isActiveOrgAdmin() ? `
-      <p style="color:var(--muted)">${c.active_project_count} active project${c.active_project_count === 1 ? '' : 's'}
-        · <a href="#/projects">manage projects</a></p>` : ''}`}
+      <p style="color:var(--muted)">${c.active_project_count} active campaign${c.active_project_count === 1 ? '' : 's'}
+        · <a href="#/projects">manage campaigns</a></p>` : ''}`}
     <div id="home-content"><div class="empty">${searchQ ? 'Searching…' : 'Loading…'}</div></div>`;
 
   $('#master-search').addEventListener('submit', (e) => {
@@ -2432,7 +2410,7 @@ async function renderRecordingsLibrary(offset = 0) {
     } catch (err) { $('#rl-list').innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
     $('#rl-list').innerHTML = data.recordings.length ? `
       <div class="card"><div class="table-wrap"><table>
-        <thead><tr><th>Entry</th><th>Language</th><th>Speaker</th><th>Length</th><th>Added</th><th>Project</th><th></th></tr></thead>
+        <thead><tr><th>Entry</th><th>Language</th><th>Speaker</th><th>Length</th><th>Added</th><th>Campaign</th><th></th></tr></thead>
         <tbody>${data.recordings.map((r) => `
           <tr>
             <td><a href="#/entries/${r.entry_id}" class="dene" lang="den">${esc(r.dene_text || r.english_text || '—')}</a></td>
@@ -2594,7 +2572,7 @@ function showDocumentUploadModal() {
       <label class="field"><span>Title (optional)</span>
         <input type="text" name="title" placeholder="defaults to the file name"></label>
       ${campaigns.length > 1 ? `
-      <label class="field"><span>Project source (optional)</span>
+      <label class="field"><span>Campaign (optional)</span>
         <select name="origin_project_id"><option value="">— none —</option>
           ${campaigns.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>` : ''}
       <p class="error-msg" hidden></p>
@@ -2820,7 +2798,7 @@ async function showCreateEntriesWizard(d) {
       <label class="field"><span>Create as</span>
         <select name="kind"><option value="word">Dictionary words</option><option value="phrase">Phrases</option></select></label>
       ${campaigns.length > 1 ? `
-      <label class="field"><span>Project (campaign the work belongs to)</span>
+      <label class="field"><span>Campaign</span>
         <select name="origin_project_id">${campaigns.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>` : ''}
       <div id="wizard-mapping"></div>
       <div id="wizard-preview" style="margin-top:0.6rem"></div>
@@ -2916,29 +2894,28 @@ async function showCreateEntriesWizard(d) {
 }
 
 async function renderProjects() {
-  const isSuper = isOrgAdmin(); // org admins get the rollup + project lifecycle
+  const isSuper = isOrgAdmin(); // org admins get the rollup + campaign lifecycle
   view.innerHTML = `<div class="empty">Loading…</div>`;
 
   let data;
   try { data = await api('/projects'); }
   catch (err) { view.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
-  // Work context (nav spec §12): campaigns operating on the ACTIVE collection.
-  const corpus = activeCorpus();
-  const projects = corpus
-    ? data.projects.filter((p) => p.corpus_id === corpus.id)
-    : data.projects.filter((p) => p.organization_id === activeOrg()?.id);
+  // Campaigns are work/funding administration for the whole organization
+  // (flat-collection spec §16) — never a content-browsing scope.
+  const projects = data.projects.filter((p) => p.organization_id === activeOrg()?.id);
 
   view.innerHTML = `
     <div class="page-head">
-      <h1>Projects</h1>
-      ${isSuper ? '<button id="new-project-btn">＋ New project</button>' : ''}
+      <h1>Campaigns</h1>
+      ${isSuper ? '<button id="new-project-btn">＋ New campaign</button>' : ''}
     </div>
-    <p style="color:var(--muted);max-width:62ch;margin-top:-0.5rem">Projects are funded
-      campaigns of work on <b>${esc(corpus?.name ?? 'this collection')}</b> — the collection
-      keeps the entries and recordings permanently, whichever campaign contributed them.</p>
+    <p style="color:var(--muted);max-width:62ch;margin-top:-0.5rem">Campaigns are funded
+      programs of work — <i>2026 Dictionary Recording</i>, <i>Youth Translation Program</i>.
+      The organization's Language collection keeps the entries and recordings permanently,
+      whichever campaign contributed them.</p>
     <div class="stat-grid">
       ${projects.map((p) => projectCardHtml(p)).join('') ||
-        '<div class="empty">No projects yet.</div>'}
+        '<div class="empty">No campaigns yet.</div>'}
     </div>
     <div id="project-detail"></div>`;
 
@@ -3008,9 +2985,9 @@ function showEditProjectModal(projectId) {
   const p = state.me.projects.find((x) => x.id === Number(projectId));
   if (!p) return;
   const m = openModal(`
-    <h2>Edit project</h2>
+    <h2>Edit campaign</h2>
     <form id="edit-project-form">
-      <label class="field"><span>Project name</span>
+      <label class="field"><span>Campaign name</span>
         <input type="text" name="name" required value="${esc(p.name)}"></label>
       <label class="field"><span>Dialect / community</span>
         <input type="text" name="dialect" value="${esc(p.dialect ?? '')}"></label>
@@ -3031,7 +3008,7 @@ function showEditProjectModal(projectId) {
         body: { name: f.name.value, dialect: f.dialect.value, description: f.description.value },
       });
       closeModal();
-      toast('Project updated');
+      toast('Campaign updated');
       await loadMe();
       renderProjects();
     } catch (err) { showFormError(f, err.message); }
@@ -3040,16 +3017,18 @@ function showEditProjectModal(projectId) {
 
 function showDeleteProjectModal(projectId, projectName) {
   const m = openModal(`
-    <h2 style="color:var(--danger)">Delete project</h2>
-    <p>This permanently deletes <b>${esc(projectName)}</b> — every entry, every audio
-      recording, and all member access. <b>This cannot be undone.</b></p>
+    <h2 style="color:var(--danger)">Delete campaign</h2>
+    <p>This permanently deletes the campaign <b>${esc(projectName)}</b> and its work
+      history. Language content in the collection is preserved — deletion is refused
+      while entries carry this campaign as their origin (close it instead).
+      <b>This cannot be undone.</b></p>
     <form id="delete-project-form">
-      <label class="field"><span>Type the project name to confirm</span>
+      <label class="field"><span>Type the campaign name to confirm</span>
         <input type="text" name="confirm_name" required autocomplete="off"
           placeholder="${esc(projectName)}"></label>
       <p class="error-msg" hidden></p>
       <div class="form-actions">
-        <button type="submit" class="danger">Delete project forever</button>
+        <button type="submit" class="danger">Delete campaign forever</button>
         <button type="button" class="ghost" onclick="document.querySelector('.modal-backdrop').remove()">Cancel</button>
       </div>
     </form>`);
@@ -3062,7 +3041,9 @@ function showDeleteProjectModal(projectId, projectName) {
         body: { confirm_name: f.confirm_name.value },
       });
       closeModal();
-      toast(`Project deleted (${r.deleted_entries} entries, ${r.deleted_recordings} recordings removed)`);
+      toast(r.deleted_entries
+        ? `Campaign deleted (${r.deleted_entries} entries, ${r.deleted_recordings} recordings removed)`
+        : 'Campaign deleted');
       await loadMe();
       renderProjects();
     } catch (err) { showFormError(f, err.message); }
@@ -3175,9 +3156,9 @@ async function showProjectActivity(projectId) {
 
 function showNewProjectModal() {
   const m = openModal(`
-    <h2>New project</h2>
+    <h2>New campaign</h2>
     <form id="proj-form">
-      <label class="field"><span>Project name</span>
+      <label class="field"><span>Campaign name</span>
         <input type="text" name="name" required placeholder="e.g. Sahtú Got'ı̨nę Yatı̨́"></label>
       <label class="field"><span>Dialect / community</span>
         <input type="text" name="dialect" placeholder="e.g. North Slavey — Délı̨nę"></label>
@@ -3185,7 +3166,7 @@ function showNewProjectModal() {
         <input type="text" name="description"></label>
       <p class="error-msg" hidden></p>
       <div class="form-actions">
-        <button type="submit">Create project</button>
+        <button type="submit">Create campaign</button>
         <button type="button" class="ghost" onclick="document.querySelector('.modal-backdrop').remove()">Cancel</button>
       </div>
     </form>`);
@@ -3203,7 +3184,7 @@ function showNewProjectModal() {
       });
       closeModal();
       await loadMe();
-      toast('Project created');
+      toast('Campaign created');
       renderProjects();
     } catch (err) { showFormError(f, err.message); }
   });
@@ -3230,7 +3211,7 @@ async function renderOrgsAdmin() {
     </div>
     <div class="card">
       <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Owners</th><th>Members</th><th>Projects</th><th>Language app</th><th>Created</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Owners</th><th>Members</th><th>Campaigns</th><th>Language app</th><th>Created</th><th></th></tr></thead>
         <tbody>
           ${data.orgs.map((o) => `
             <tr>
@@ -3249,7 +3230,7 @@ async function renderOrgsAdmin() {
       </table></div>
       <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0">
         Organizations own their corpus — platform administration grants no access to any
-        organization's data. Each organization's owner manages its projects, members,
+        organization's data. Each organization's owner manages its campaigns, members,
         consent profiles, and exports from their own <b>Organization</b> page.</p>
     </div>`;
 
@@ -3342,7 +3323,7 @@ async function renderUsers() {
     </div>
     <div class="card">
       <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Email</th><th>Projects</th><th>Entries</th><th>Recordings</th><th>Created</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Email</th><th>Campaigns</th><th>Entries</th><th>Recordings</th><th>Created</th><th></th></tr></thead>
         <tbody>
           ${data.users.map((u) => `
             <tr>
@@ -3366,14 +3347,14 @@ async function renderUsers() {
         Accounts with contributions can't be deleted (attribution is preserved) — remove them
         from their organization instead, which revokes all access. Membership is managed
         on the <a href="#/org">Organization</a> page: one list, and a role applies to every
-        project the organization runs.</p>
+        campaign the organization runs.</p>
     </div>`;
 
   $('#new-user-btn').addEventListener('click', () => {
     const m = openModal(`
       <h2>New account</h2>
-      <p style="color:var(--muted);font-size:0.9rem">The account starts with no project access —
-        add it to a project from the Dashboard → Members.</p>
+      <p style="color:var(--muted);font-size:0.9rem">The account starts with no organization —
+        an organization owner or admin adds it from their People page.</p>
       <form id="user-form">
         <label class="field"><span>Name</span><input type="text" name="name" required></label>
         <label class="field"><span>Email</span><input type="email" name="email" required></label>
@@ -3420,7 +3401,7 @@ async function renderUsers() {
     } else if (btn.dataset.act === 'super') {
       const makeSuper = btn.dataset.super !== '1';
       if (!confirm(makeSuper
-        ? 'Grant superadmin? They will have full access to every project and all user management.'
+        ? 'Grant superadmin? They will have full access to every organization and all user management.'
         : 'Revoke superadmin access for this user?')) return;
       try {
         await api(`/users/${id}`, { method: 'PATCH', body: { is_superadmin: makeSuper } });
@@ -3516,7 +3497,7 @@ async function renderOrganization() {
 }
 
 // Manage → Consent (nav spec §13): consent-profile administration for the
-// active organization; per-project defaults stay on the Projects page.
+// active organization; per-campaign defaults stay on the Campaigns page.
 async function renderConsent() {
   const org = activeOrg();
   if (!org || !isActiveOrgAdmin()) { location.hash = '#/home'; return; }
@@ -3534,8 +3515,8 @@ async function renderConsent() {
     <div class="page-head"><h1>Consent</h1></div>
     <p style="color:var(--muted);max-width:60ch">Reusable bundles of permitted uses for
       <b>${esc(org.name)}</b>. Recordings keep a snapshot of the profile at assignment
-      time — editing or deleting a profile never changes past consent. Set each project's
-      default profile from <a href="#/projects">Projects</a> → Consent.</p>
+      time — editing or deleting a profile never changes past consent. Set each campaign's
+      default profile from <a href="#/projects">Campaigns</a> → Consent.</p>
     <div class="card">
       ${profiles.map((p) => `
         <div class="version-row">
@@ -3555,7 +3536,7 @@ async function renderConsent() {
   view.onclick = async (e) => {
     const pd = e.target.closest('button[data-profile-delete]');
     if (!pd) return;
-    if (!confirm('Delete this consent profile? Recordings keep their snapshots; projects using it as a default fall back to consent-unknown.')) return;
+    if (!confirm('Delete this consent profile? Recordings keep their snapshots; campaigns using it as a default fall back to consent-unknown.')) return;
     try {
       await api(`/consent-profiles/${pd.dataset.profileDelete}`, { method: 'DELETE' });
       toast('Profile deleted');
@@ -3584,12 +3565,10 @@ async function loadMe() {
   if (!state.me.orgs.some((o) => o.id === state.activeOrgId)) {
     state.activeOrgId = state.me.orgs[0]?.id ?? null;
   }
-  // Collections (corpora) are the Library's content context (nav spec §7).
+  // The Language collection is derived per organization (flat-collection
+  // spec §7) — corpora load for stats/derivation, never for user selection.
   try { state.corpora = (await api('/corpora')).corpora; }
   catch { state.corpora = []; }
-  if (!orgCorpora().some((c) => c.id === state.activeCorpusId)) {
-    state.activeCorpusId = orgCorpora()[0]?.id ?? null;
-  }
   if (!orgProjects().some((p) => p.id === state.activeProjectId)) {
     state.activeProjectId = corpusProjects()[0]?.id ?? orgProjects()[0]?.id ?? null;
   }

@@ -157,11 +157,11 @@ const preexistingMembers = new Set(
 
 // --- projects ---
 const pname = `Smoke Test ${Date.now()}`;
-r = await sa.req('POST', '/api/projects', { name: pname, dialect: 'Dëne Sųłıné' });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: pname, dialect: 'Dëne Sųłıné' });
 check('superadmin creates project', r.status === 201, JSON.stringify(r.data));
 const projectId = r.data.id;
 
-r = await sa.req('POST', '/api/projects', { name: pname });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: pname });
 check('duplicate project name rejected', r.status === 400);
 
 // --- members ---
@@ -195,7 +195,7 @@ check('member cannot add members', r.status === 403);
 // stranger: a user in no projects
 const strangerEmail = `stranger${Date.now()}@test.ca`;
 // create a second project + user to test isolation
-r = await sa.req('POST', '/api/projects', { name: pname + ' B' });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: pname + ' B' });
 const projectB = r.data.id;
 r = await sa.req('POST', `/api/projects/${projectB}/members`,
   { email: strangerEmail, name: 'Stranger', password: 'stranger-pass-1' });
@@ -455,7 +455,7 @@ await member2.req('DELETE', `/api/audio/${member2AudioId}`);
 
 // --- work items: claiming, leases, transactional billing (#3/#4) ---
 // Dedicated project so the candidate sets are controlled and stats above are untouched.
-r = await sa.req('POST', '/api/projects', { name: pname + ' WI', dialect: 'x' });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: pname + ' WI', dialect: 'x' });
 const wiProj = r.data.id;
 const aEmail = `wi-a-${Date.now()}@test.ca`;
 const bEmail = `wi-b-${Date.now()}@test.ca`;
@@ -730,7 +730,7 @@ r = await sa.req('POST', `/api/projects/${projectId}/import`, fd, true);
 check('non-CSV file rejected', r.status === 400);
 
 // --- import/export by kind (isolated project so other counts are unaffected) ---
-r = await sa.req('POST', '/api/projects', { name: pname + ' Imp' });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: pname + ' Imp' });
 const impProj = r.data.id;
 
 let impCsv = 'dene_text,english_text\nkų,house\nłı,dog\n';
@@ -871,7 +871,7 @@ for (const pid of [phraseDeneOnly, phraseEngOnly, phraseBoth]) {
 }
 
 // --- compensation (self-contained in its own project) ---
-r = await sa.req('POST', '/api/projects', { name: pname + ' Comp' });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: pname + ' Comp' });
 const compProj = r.data.id;
 await sa.req('POST', `/api/projects/${compProj}/members`, { email: translatorEmail, role: 'translator' });
 
@@ -1162,7 +1162,7 @@ check('platform admin without org grant sees no projects', r.status === 200 && r
   JSON.stringify(r.data.projects?.length));
 // a dedicated corpus project for the 403 probes (fresh installs have none left)
 const sepProbeName = `Sep Probe ${Date.now()}`;
-const anyProj = (await sa.req('POST', '/api/projects', { name: sepProbeName })).data;
+const anyProj = (await sa.req('POST', '/api/projects', { new_corpus: true, name: sepProbeName })).data;
 // With zero visible projects, /entries short-circuits to an empty 200 — either
 // way, no corpus content comes back.
 r = await ps.req('GET', `/api/entries?project_id=${anyProj.id}`);
@@ -1216,7 +1216,7 @@ r = await member.req('GET', `/api/orgs/${orgId}/members`);
 check('ordinary member cannot read org membership', r.status === 403);
 
 // Multi-org ambiguity: sa now administers two orgs.
-r = await sa.req('POST', '/api/projects', { name: `Ambiguous ${Date.now()}` });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `Ambiguous ${Date.now()}` });
 check('multi-org admin must specify organization_id', r.status === 400);
 
 // --- multi-org COMPENSATION isolation (hardening #1) ---
@@ -1246,7 +1246,7 @@ check('org2 admin records an org2 payment', r.status === 201, JSON.stringify(r.d
 
 // Project names are unique PER ORGANIZATION — two orgs can both have "Winter Words".
 const crossName = `Cross Name ${Date.now()}`;
-r = await sa.req('POST', '/api/projects', { name: crossName, organization_id: mainOrg.id });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: crossName, organization_id: mainOrg.id });
 check('org1 creates the shared-name project', r.status === 201, JSON.stringify(r.data));
 const crossOrg1 = r.data.id;
 r = await oa.req('POST', '/api/projects', { name: crossName });
@@ -1297,13 +1297,22 @@ check('removed org admin gets 403 on scoped reads', r.status === 403);
 r = await oa.req('POST', '/api/projects', { name: `After Removal ${Date.now()}` });
 check('removed org admin cannot create projects', r.status === 403);
 
-// clean up: sa owns the fresh org, so it can delete the org project, then the
-// (now empty) org itself — restoring sa to a single admin org so the suite is
-// repeatable without organization_id everywhere.
+// clean up: sa owns the fresh org, so it can delete the org campaign, then
+// the (now empty) org itself — restoring sa to a single admin org so the
+// suite is repeatable without organization_id everywhere.
 r = await sa.req('DELETE', `/api/orgs/${orgId}`);
-check('an org owning projects cannot be deleted', r.status === 400);
+check('an org owning campaigns cannot be deleted', r.status === 400);
+// Flat model: the campaign sits on the fresh org's DEFAULT collection, so
+// deleting it never sweeps content — and it is refused while entries or work
+// cite it. Purge the test content at the db level first (the same pattern as
+// the roster restore), then the campaign and org delete cleanly.
+{
+  const { default: db } = await import('../src/db.js');
+  db.prepare(`DELETE FROM entries WHERE corpus_id IN (SELECT id FROM corpora WHERE organization_id = ?)`).run(orgId);
+  db.prepare('DELETE FROM work_items WHERE project_id = ?').run(orgProjId);
+}
 r = await sa.req('DELETE', `/api/projects/${orgProjId}`, { confirm_name: orgProjName });
-check('org owner deletes the org project (cleanup)', r.status === 200, JSON.stringify(r.data));
+check('org owner deletes the org campaign (cleanup)', r.status === 200, JSON.stringify(r.data));
 r = await sa.req('DELETE', `/api/orgs/${orgId}`);
 check('empty org deleted (cleanup restores single-org state)', r.status === 200, JSON.stringify(r.data));
 
@@ -1320,7 +1329,7 @@ const profId = r.data.id;
 const profName = r.data.name;
 
 const cpName = `Consent Test ${Date.now()}`;
-r = await sa.req('POST', '/api/projects', { name: cpName });
+r = await sa.req('POST', '/api/projects', { new_corpus: true, name: cpName });
 const cpId = r.data.id;
 r = await sa.req('POST', '/api/entries', { project_id: cpId, dene_text: 'tł’ok’ale', english_text: 'grass' });
 const cpEntry = r.data.id;
@@ -1556,7 +1565,7 @@ if (BASE.includes('localhost')) {
   try {
     const { default: db } = await import('../src/db.js');
     const spkProjName = `Spk ${Date.now()}`;
-    r = await sa.req('POST', '/api/projects', { name: spkProjName, dialect: 'Dëne Sųłıné' });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: spkProjName, dialect: 'Dëne Sųłıné' });
     const spkProj = r.data.id;
     r = await sa.req('POST', '/api/entries', {
       project_id: spkProj, kind: 'word', dene_text: 'setsıé', english_text: 'my grandfather',
@@ -1646,9 +1655,9 @@ if (BASE.includes('localhost')) {
     const orgA = r.data.id;
     r = await sa.req('POST', '/api/orgs', { name: `EntIso B ${ts}` });
     const orgB = r.data.id;
-    r = await sa.req('POST', '/api/projects', { name: `EntIso ProjA ${ts}`, organization_id: orgA });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `EntIso ProjA ${ts}`, organization_id: orgA });
     const projA = r.data.id;
-    r = await sa.req('POST', '/api/projects', { name: `EntIso ProjB ${ts}`, organization_id: orgB });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `EntIso ProjB ${ts}`, organization_id: orgB });
     const projB = r.data.id;
     r = await sa.req('POST', '/api/entries', { project_id: projA, kind: 'phrase', dene_text: 'A-side' });
     const entryA = r.data.id;
@@ -1723,7 +1732,7 @@ if (BASE.includes('localhost')) {
 {
   const ts = Date.now();
   const docProjName = `Docs ${ts}`;
-  r = await sa.req('POST', '/api/projects', { name: docProjName, dialect: 'Dëne Sųłıné' });
+  r = await sa.req('POST', '/api/projects', { new_corpus: true, name: docProjName, dialect: 'Dëne Sųłıné' });
   const docProj = r.data;
   const corpusId = docProj.corpus_id;
 
@@ -1886,7 +1895,7 @@ if (BASE.includes('localhost')) {
   const { default: db } = await import('../src/db.js');
   const ts = Date.now();
   const impProjName = `Import ${ts}`;
-  r = await sa.req('POST', '/api/projects', { name: impProjName, dialect: 'Dëne Sųłıné' });
+  r = await sa.req('POST', '/api/projects', { new_corpus: true, name: impProjName, dialect: 'Dëne Sųłıné' });
   const impProj = r.data;
   const impCorpus = impProj.corpus_id;
 
@@ -2006,10 +2015,10 @@ if (BASE.includes('localhost')) {
   const ts = Date.now();
   const projAName = `SearchA ${ts}`;
   const projBName = `SearchB ${ts}`;
-  r = await sa.req('POST', '/api/projects', { name: projAName, dialect: 'Dëne Sųłıné' });
+  r = await sa.req('POST', '/api/projects', { new_corpus: true, name: projAName, dialect: 'Dëne Sųłıné' });
   const projA = r.data;
   const corpusA = projA.corpus_id;
-  r = await sa.req('POST', '/api/projects', { name: projBName, dialect: 'Dëne Sųłıné' });
+  r = await sa.req('POST', '/api/projects', { new_corpus: true, name: projBName, dialect: 'Dëne Sųłıné' });
   const projB = r.data;
   const corpusB = projB.corpus_id;
 
@@ -2171,7 +2180,7 @@ if (BASE.includes('localhost')) {
   const { execSync } = await import('node:child_process');
   const ts = Date.now();
   const projName = `DocSem ${ts}`;
-  r = await sa.req('POST', '/api/projects', { name: projName, dialect: 'Dëne Sųłıné' });
+  r = await sa.req('POST', '/api/projects', { new_corpus: true, name: projName, dialect: 'Dëne Sųłıné' });
   const proj = r.data;
   const corpusId = proj.corpus_id;
 
@@ -2301,6 +2310,105 @@ if (BASE.includes('localhost')) {
   check('docsem: cleanup complete', r.status === 200, JSON.stringify(r.data));
 }
 
+// --- flat language collection (flat-collection spec §39–§43) ---
+{
+  const { default: db } = await import('../src/db.js');
+  const ts = Date.now();
+
+  // §39 New Organization: creating it (Language enabled by default) creates
+  // the default collection — nobody names or chooses it.
+  const orgName = `FlatOrg ${ts}`;
+  const ownerEmail = `flatowner-${ts}@test.ca`;
+  r = await sa.req('POST', '/api/users', { email: ownerEmail, name: 'Flat Owner', password: 'flatowner-pass-1' });
+  const ownerId = r.data.user_id ?? r.data.id;
+  r = await sa.req('POST', '/api/orgs', { name: orgName, owner_email: ownerEmail });
+  const orgId = r.data.id;
+  const defCorpus = db.prepare('SELECT * FROM corpora WHERE organization_id = ? AND is_default = 1').get(orgId);
+  check('flat: new organization gets its default Language collection automatically',
+    !!defCorpus && defCorpus.name === 'Language Collection', JSON.stringify(defCorpus ?? null));
+
+  // §39 Uniqueness: a second default is impossible.
+  let dupErr = null;
+  try {
+    db.prepare(`INSERT INTO corpora (uid, organization_id, name, is_default) VALUES (?, ?, 'Dup', 1)`)
+      .run(`dup-${ts}`, orgId);
+  } catch (e) { dupErr = e; }
+  check('flat: two default collections per organization are impossible',
+    !!dupErr && /unique/i.test(dupErr.message), dupErr?.message);
+
+  // Campaigns created by the ORG OWNER (not superadmin) attach to the default
+  // collection — no corpus is created, none can be chosen.
+  const owner = client();
+  await owner.req('POST', '/api/login', { email: ownerEmail, password: 'flatowner-pass-1' });
+  r = await owner.req('POST', '/api/projects', { name: `Camp One ${ts}` });
+  const camp1 = r.data;
+  r = await owner.req('POST', '/api/projects', { name: `Camp Two ${ts}`, new_corpus: true }); // ignored for non-superadmins
+  const camp2 = r.data;
+  check('flat: campaigns share the default collection (new_corpus is superadmin tooling)',
+    camp1.corpus_id === defCorpus.id && camp2.corpus_id === defCorpus.id,
+    JSON.stringify([camp1.corpus_id, camp2.corpus_id, defCorpus.id]));
+  check('flat: non-superadmins can never spawn extra corpora',
+    db.prepare('SELECT COUNT(*) n FROM corpora WHERE organization_id = ?').get(orgId).n === 1);
+
+  // §42 Campaign independence: campaign 1 creates Entry X, campaign 2 exists
+  // alongside; closing campaign 1 hides nothing.
+  r = await owner.req('POST', '/api/entries', { project_id: camp1.id, kind: 'word', dene_text: 'tth’ay', english_text: 'plate' });
+  const entryX = r.data.id;
+  check('flat: entries land in the default collection automatically',
+    db.prepare('SELECT corpus_id FROM entries WHERE id = ?').get(entryX).corpus_id === defCorpus.id);
+  let ffd = new FormData();
+  ffd.append('file', new Blob([makeWav(1)], { type: 'audio/wav' }), 'flat.wav');
+  ffd.append('language', 'dene');
+  r = await owner.req('POST', `/api/entries/${entryX}/audio`, ffd, true);
+  check('flat: recording created', r.status === 201, r.status);
+  const recY = r.data.id;
+  await owner.req('PATCH', `/api/projects/${camp1.id}`, { status: 'closed' });
+  r = await owner.req('GET', `/api/entries/${entryX}`);
+  check('flat: closing a campaign never hides permanent content', r.status === 200, r.status);
+  r = await owner.req('GET', `/api/search?corpus_id=${defCorpus.id}&q=plate`);
+  check('flat: master search still finds the closed campaign’s entry and recording',
+    r.data.entries.results.some((e) => e.id === entryX) &&
+    r.data.recordings.results.some((x) => x.id === recY),
+    JSON.stringify({ e: r.data.entries?.results?.length, r: r.data.recordings?.results?.length }));
+  r = await owner.req('GET', `/api/home?corpus_id=${defCorpus.id}`);
+  check('flat: home latest shows content regardless of campaign state',
+    r.data.entries.some((e) => e.id === entryX));
+
+  // Deleting a default-collection campaign is refused while content cites it;
+  // an empty campaign deletes cleanly and the collection is untouched.
+  await owner.req('PATCH', `/api/projects/${camp1.id}`, { status: 'active' });
+  r = await owner.req('DELETE', `/api/projects/${camp1.id}`, { confirm_name: `Camp One ${ts}` });
+  check('flat: campaign delete refused while entries cite it (close instead)', r.status === 400, r.status);
+  r = await owner.req('DELETE', `/api/projects/${camp2.id}`, { confirm_name: `Camp Two ${ts}` });
+  check('flat: empty campaign deletes without touching the collection',
+    r.status === 200 && r.data.deleted_entries === 0 &&
+    (await owner.req('GET', `/api/entries/${entryX}`)).status === 200,
+    JSON.stringify(r.data));
+
+  // The frontend derives the collection from /corpora's default flag.
+  r = await owner.req('GET', '/api/corpora');
+  check('flat: /corpora marks the default collection',
+    r.data.corpora?.find((c) => c.id === defCorpus.id)?.is_default === 1,
+    JSON.stringify(r.data.corpora?.map((c) => [c.id, c.is_default]) ?? r.data));
+
+  // Re-enabling Language is idempotent — still exactly one default.
+  await sa.req('PUT', `/api/orgs/${orgId}/apps/language`, { status: 'disabled' });
+  await sa.req('PUT', `/api/orgs/${orgId}/apps/language`, { status: 'enabled' });
+  check('flat: re-enabling Language never duplicates the default collection',
+    db.prepare('SELECT COUNT(*) n FROM corpora WHERE organization_id = ? AND is_default = 1').get(orgId).n === 1);
+
+  // cleanup: entry (recording cascades), campaign, org (takes its empty
+  // default collection with it), owner account.
+  await owner.req('DELETE', `/api/entries/${entryX}`);
+  r = await owner.req('DELETE', `/api/projects/${camp1.id}`, { confirm_name: `Camp One ${ts}` });
+  check('flat: campaign deletable once nothing cites it', r.status === 200, JSON.stringify(r.data));
+  r = await owner.req('DELETE', `/api/orgs/${orgId}`);
+  check('flat: org delete sweeps its empty default collection', r.status === 200 &&
+    !db.prepare('SELECT 1 FROM corpora WHERE organization_id = ?').get(orgId), JSON.stringify(r.data));
+  r = await sa.req('DELETE', `/api/users/${ownerId}`);
+  check('flat: cleanup complete', r.status === 200, JSON.stringify(r.data));
+}
+
 // --- root sign-in page ---
 {
   const anon = client();
@@ -2341,7 +2449,7 @@ if (BASE.includes('localhost')) {
     const { default: db } = await import('../src/db.js');
     const ts = Date.now();
     const nameA = `Corpus A ${ts}`;
-    r = await sa.req('POST', '/api/projects', { name: nameA, dialect: 'Dëne Sųłıné' });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: nameA, dialect: 'Dëne Sųłıné' });
     const projA = r.data;
     check('a new project is born with its own corpus (active campaign)',
       !!projA.corpus_id && projA.status === 'active', JSON.stringify({ c: projA.corpus_id, s: projA.status }));
@@ -2349,7 +2457,7 @@ if (BASE.includes('localhost')) {
     check('entries carry their corpus', r.data.corpus_id === projA.corpus_id);
 
     // A second funding campaign contributes to the SAME permanent corpus.
-    r = await sa.req('POST', '/api/projects', { name: `Corpus B ${ts}`, dialect: 'Dëne Sųłıné', corpus_id: projA.corpus_id });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `Corpus B ${ts}`, dialect: 'Dëne Sųłıné', corpus_id: projA.corpus_id });
     const projB = r.data;
     check('a second campaign can join an existing corpus', projB.corpus_id === projA.corpus_id);
     r = await sa.req('POST', '/api/entries', { project_id: projB.id, kind: 'word', dene_text: 'deh', english_text: 'river' });
@@ -2399,9 +2507,9 @@ if (BASE.includes('localhost')) {
   try {
     const { default: db } = await import('../src/db.js');
     const ts = Date.now();
-    r = await sa.req('POST', '/api/projects', { name: `Own A ${ts}`, dialect: 'Dëne Sųłıné' });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `Own A ${ts}`, dialect: 'Dëne Sųłıné' });
     const projCA = r.data;
-    r = await sa.req('POST', '/api/projects', { name: `Own B ${ts}`, corpus_id: projCA.corpus_id });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `Own B ${ts}`, corpus_id: projCA.corpus_id });
     const projCB = r.data;
     // Campaign A creates a one-sided entry (translation work for the corpus).
     r = await sa.req('POST', '/api/entries', { project_id: projCA.id, kind: 'phrase', dene_text: 'ɂerıhtł’é' });
@@ -2459,7 +2567,7 @@ if (BASE.includes('localhost')) {
     // Integrity: a project cannot adopt a corpus from another organization.
     r = await sa.req('POST', '/api/orgs', { name: `Own X ${ts}` });
     const orgX = r.data.id;
-    r = await sa.req('POST', '/api/projects', { name: `Own XProj ${ts}`, organization_id: orgX, corpus_id: projCA.corpus_id });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: `Own XProj ${ts}`, organization_id: orgX, corpus_id: projCA.corpus_id });
     check('own: a project cannot reference a corpus from another organization', r.status === 400, r.status);
     await sa.req('DELETE', `/api/orgs/${orgX}`);
 
@@ -2482,7 +2590,7 @@ if (BASE.includes('localhost')) {
 {
   const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   const uidName = `Uid ${Date.now()}`;
-  r = await sa.req('POST', '/api/projects', { name: uidName, dialect: 'Dëne Sųłıné' });
+  r = await sa.req('POST', '/api/projects', { new_corpus: true, name: uidName, dialect: 'Dëne Sųłıné' });
   const uidProj = r.data;
   check('new projects are born with a UUIDv7 uid', UUID7.test(uidProj.uid ?? ''), uidProj.uid);
   r = await sa.req('POST', '/api/entries', { project_id: uidProj.id, kind: 'word', dene_text: 'tu', english_text: 'water' });
@@ -2513,7 +2621,7 @@ if (BASE.includes('localhost')) {
   try {
     const { default: db } = await import('../src/db.js');
     const laName = `LangAbs ${Date.now()}`;
-    r = await sa.req('POST', '/api/projects', { name: laName, dialect: 'Tłı̨chǫ' });
+    r = await sa.req('POST', '/api/projects', { new_corpus: true, name: laName, dialect: 'Tłı̨chǫ' });
     const laProj = r.data.id;
     r = await sa.req('POST', '/api/entries', {
       project_id: laProj, kind: 'word', dene_text: 'sombak’è', english_text: 'money place',
